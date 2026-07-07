@@ -10,3 +10,6 @@ google-genai
 slack_sdk==3.33.5
 aiohttp==3.12.15
 APScheduler==3.10.4
+pytest
+pytest-asyncio
+pytest-mock
