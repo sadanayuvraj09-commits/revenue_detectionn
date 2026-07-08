@@ -13,3 +13,7 @@ APScheduler==3.10.4
 pytest
 pytest-asyncio
 pytest-mock
+streamlit
+pandas
+requests
+certifi

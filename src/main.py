@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
+from pymongo import UpdateOne
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -63,10 +64,31 @@ scheduler = AsyncIOScheduler()
 
 _gap_detection_cache: dict[int, dict[str, Any]] = {}
 _gap_detection_cache_lock = asyncio.Lock()
+_gap_detection_cache_ttl_seconds = 30
+_gap_detection_cache_timestamp: float | None = None
+_detected_gaps_response_cache: dict[int, dict[str, Any]] = {}
+_detected_gaps_response_cache_lock = asyncio.Lock()
+_detected_gaps_response_cache_timestamp: float | None = None
 
 
 def invalidate_gap_detection_cache() -> None:
+    global _gap_detection_cache_timestamp, _detected_gaps_response_cache_timestamp
     _gap_detection_cache.clear()
+    _gap_detection_cache_timestamp = None
+    _detected_gaps_response_cache.clear()
+    _detected_gaps_response_cache_timestamp = None
+
+
+def _gap_detection_cache_is_valid() -> bool:
+    if _gap_detection_cache_timestamp is None:
+        return False
+    return (datetime.now(timezone.utc).timestamp() - _gap_detection_cache_timestamp) < _gap_detection_cache_ttl_seconds
+
+
+def _detected_gaps_response_cache_is_valid() -> bool:
+    if _detected_gaps_response_cache_timestamp is None:
+        return False
+    return (datetime.now(timezone.utc).timestamp() - _detected_gaps_response_cache_timestamp) < _gap_detection_cache_ttl_seconds
 
 
 def _fingerprint_docs(docs: list[dict[str, Any]]) -> str:
@@ -131,6 +153,8 @@ def validate_timesheet_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
+    global _gap_detection_cache_timestamp
+
     timesheets = await db["timesheet_entries"].find().to_list(limit)
     activity_count = await db["activity_logs"].count_documents({"source": {"$in": list(ACTIVITY_SOURCES)}})
     cache_key = (
@@ -141,7 +165,7 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
     )
 
     async with _gap_detection_cache_lock:
-        if cache_key in _gap_detection_cache:
+        if _gap_detection_cache_is_valid() and cache_key in _gap_detection_cache:
             return deepcopy(_gap_detection_cache[cache_key])
 
     ts_lookup = {
@@ -181,29 +205,37 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
             }
         )
 
+    # Use a single bulk_write to upsert all gaps to avoid N round-trips.
     new_gaps = []
-    for gap in gaps:
-        existing = await db["detected_gaps"].find_one(
-            {"developer_id": gap["developer_id"], "date": gap["date"]}
-        )
-        if existing:
-            existing_id = existing.get("_id")
-            if existing_id is not None:
-                await db["detected_gaps"].update_one(
-                    {"_id": existing_id},
-                    {"$set": {**gap, "status": existing.get("status", "pending")}},
-                )
-            else:
-                await db["detected_gaps"].update_one(
-                    {"developer_id": gap["developer_id"], "date": gap["date"]},
-                    {"$set": {**gap, "status": existing.get("status", "pending")}},
-                )
-        else:
-            gap["status"] = "pending"
-            new_gaps.append(gap)
+    if gaps:
+        # Fetch existing docs for these developer/date pairs in one query
+        or_filters = [{"developer_id": g["developer_id"], "date": g["date"]} for g in gaps]
+        existing_docs = []
+        if or_filters:
+            existing_docs = await db["detected_gaps"].find({"$or": or_filters}).to_list(len(or_filters))
 
-    if new_gaps:
-        await db["detected_gaps"].insert_many(new_gaps)
+        existing_map = {
+            (d.get("developer_id"), d.get("date")): d for d in existing_docs
+        }
+
+        operations = []
+        for gap in gaps:
+            key = (gap["developer_id"], gap["date"])
+            existing = existing_map.get(key)
+            status = existing.get("status") if existing else "pending"
+            gap_doc = {**gap, "status": status}
+            if existing is None:
+                new_gaps.append(gap)
+            operations.append(
+                UpdateOne(
+                    {"developer_id": gap["developer_id"], "date": gap["date"]},
+                    {"$set": gap_doc},
+                    upsert=True,
+                )
+            )
+
+        if operations:
+            await db["detected_gaps"].bulk_write(operations, ordered=False)
 
     # Strip any MongoDB _id fields that insert_many may have attached in-place,
     # since ObjectId isn't JSON-serializable.
@@ -217,6 +249,7 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
 
     async with _gap_detection_cache_lock:
         _gap_detection_cache[cache_key] = deepcopy(result)
+        _gap_detection_cache_timestamp = datetime.now(timezone.utc).timestamp()
 
     return result
 
@@ -230,8 +263,38 @@ async def scheduled_gap_detection() -> None:
         print(f"Automatic gap detection failed: {exc}")
 
 
+async def write_detected_gaps_snapshot(limit: int = 5000) -> dict[str, Any]:
+    """Compute gap detection and store a ready-to-serve snapshot in the DB.
+
+    This allows the API to return a precomputed result quickly instead of
+    performing expensive work on-demand.
+    """
+    result = await run_gap_detection(limit)
+    snapshot_doc = {
+        "name": "current",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **result,
+    }
+    await db["detected_gaps_snapshot"].replace_one(
+        {"name": "current"}, snapshot_doc, upsert=True
+    )
+    print("Wrote detected_gaps snapshot to DB")
+    return result
+
+
+async def _initialize_database_indexes() -> None:
+    try:
+        await db["activity_logs"].create_index([("developer_id", 1), ("date", 1)])
+        await db["activity_logs"].create_index([("source", 1), ("activity_type", 1)])
+        await db["timesheet_entries"].create_index([("developer_id", 1), ("date", 1)])
+        await db["detected_gaps"].create_index([("developer_id", 1), ("date", 1)])
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 async def start_gap_detection_scheduler():
+    await _initialize_database_indexes()
     if not scheduler.running:
         scheduler.add_job(
             scheduled_gap_detection,
@@ -240,6 +303,20 @@ async def start_gap_detection_scheduler():
             id="automatic_gap_detection",
             replace_existing=True,
         )
+        # Also precompute a snapshot more frequently so the API can return
+        # results instantly without running expensive detection on request.
+        scheduler.add_job(
+            write_detected_gaps_snapshot,
+            "interval",
+            minutes=5,
+            id="detected_gaps_snapshot",
+            replace_existing=True,
+        )
+        # Prime the snapshot immediately on startup
+        try:
+            await write_detected_gaps_snapshot()
+        except Exception:
+            pass
         scheduler.start()
 
 
@@ -256,8 +333,25 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    collections = await db.list_collection_names()
-    return {"status": "MongoDB connected", "collections": collections}
+    try:
+        collections = await db.list_collection_names()
+        return {
+            "status": "ok",
+            "ready": True,
+            "database": {
+                "status": "connected",
+                "collections": collections,
+            },
+        }
+    except Exception as exc:
+        return {
+            "status": "degraded",
+            "ready": False,
+            "database": {
+                "status": "disconnected",
+                "error": str(exc),
+            },
+        }
 
 
 @app.post("/fetch_commits", dependencies=[Depends(verify_api_key)])
@@ -444,9 +538,31 @@ async def delete_timesheet(developer_id: str, date: str):
 
 
 @app.get("/detected_gaps")
-async def get_detected_gaps(limit: int = Query(default=1000, ge=1, le=5000)):
+async def get_detected_gaps(limit: int = Query(default=1000, ge=1, le=5000), force: bool = Query(default=False)):
+    """Return a precomputed snapshot of detected gaps for fast responses.
+
+    By default this reads the latest snapshot written by the background job.
+    Set `?force=true` to recompute on-demand (not recommended for regular use).
+    """
     try:
-        return await run_gap_detection(limit)
+        if force:
+            result = await run_gap_detection(limit)
+            await db["detected_gaps_snapshot"].replace_one(
+                {"name": "current"}, {"name": "current", "generated_at": datetime.now(timezone.utc).isoformat(), **result}, upsert=True
+            )
+            return result
+
+        snapshot = await db["detected_gaps_snapshot"].find_one({"name": "current"})
+        if snapshot:
+            # Return stored fields (strip internal keys)
+            return {k: v for k, v in snapshot.items() if k not in ("_id", "name", "generated_at")}
+
+        # Fallback to on-demand computation if no snapshot exists
+        result = await run_gap_detection(limit)
+        await db["detected_gaps_snapshot"].replace_one(
+            {"name": "current"}, {"name": "current", "generated_at": datetime.now(timezone.utc).isoformat(), **result}, upsert=True
+        )
+        return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to detect gaps: {exc}") from exc
 
@@ -458,19 +574,24 @@ async def summarize_gaps():
     if not gaps:
         return {"message": "No pending gaps found."}
 
+    footprint_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    footprint_docs = await build_all_footprints(limit=max(100, len(gaps) * 5))
+    for footprint in footprint_docs:
+        footprint_lookup[(footprint["developer_id"], footprint["date"])] = footprint
+
     updated = []
     for gap in gaps:
-        developer_id = gap.get("developer_id", "UNKNOWN")
+        developer_id = normalize_developer_id(gap.get("developer_id", "UNKNOWN"))
         date = normalize_activity_date(gap.get("date"))
+        footprint = footprint_lookup.get((developer_id, date), {})
         enriched_gap = {
             **gap,
-            "developer_id": normalize_developer_id(developer_id),
+            "developer_id": developer_id,
             "date": date,
-            **await build_developer_footprint(developer_id, date),
+            **footprint,
         }
 
         summary = generate_ai_summary(enriched_gap)
-        await asyncio.sleep(1)
 
         await db["detected_gaps"].update_one(
             {"_id": gap["_id"]},
@@ -478,9 +599,9 @@ async def summarize_gaps():
                 "$set": {
                     "summary": summary,
                     "status": "summarized",
-                    "github_count": enriched_gap["github_count"],
-                    "slack_count": enriched_gap["slack_count"],
-                    "jira_count": enriched_gap["jira_count"],
+                    "github_count": enriched_gap.get("github_count", 0),
+                    "slack_count": enriched_gap.get("slack_count", 0),
+                    "jira_count": enriched_gap.get("jira_count", 0),
                 }
             },
         )
@@ -543,15 +664,49 @@ async def check_gaps(limit: int = Query(default=100, ge=1, le=1000)):
 
 @app.post("/refresh_gaps")
 async def refresh_gaps():
-    """Clear all detected gaps and re-run gap detection fresh."""
+    """Re-run gap detection and compare new detected gaps against the existing collection."""
     try:
-        delete_result = await db["detected_gaps"].delete_many({})
+        existing_gap_docs = await db["detected_gaps"].find({}).to_list(5000)
+        existing_keys = {
+            (
+                normalize_developer_id(doc.get("developer_id")),
+                normalize_activity_date(doc.get("date")),
+            )
+            for doc in existing_gap_docs
+            if doc.get("developer_id") is not None and doc.get("date") is not None
+        }
+
+        invalidate_gap_detection_cache()
         detection_result = await run_gap_detection()
+
+        detected_gaps = detection_result.get("detected_gaps", []) or []
+        new_keys = {
+            (
+                normalize_developer_id(gap.get("developer_id")),
+                normalize_activity_date(gap.get("date")),
+            )
+            for gap in detected_gaps
+            if gap.get("developer_id") is not None and gap.get("date") is not None
+        }
+        new_count = len(new_keys - existing_keys)
+        total_count = await db["detected_gaps"].count_documents({})
+
+        await db["detected_gaps_snapshot"].replace_one(
+            {"name": "current"},
+            {
+                "name": "current",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                **detection_result,
+            },
+            upsert=True,
+        )
         return {
             "message": "Gaps refreshed successfully",
-            "cleared": delete_result.deleted_count,
-            "new_total_gaps": detection_result["total_gaps"],
-            "new_gaps_saved": detection_result["new_gaps_saved"],
+            "cleared": 0,
+            "new_total_gaps": total_count,
+            "new_gaps_saved": new_count,
+            "new_count": new_count,
+            "total_count": total_count,
         }
     except Exception as exc:
         raise HTTPException(
@@ -565,6 +720,17 @@ async def clear_gaps():
     """Delete all documents from detected_gaps collection."""
     try:
         result = await db["detected_gaps"].delete_many({})
+        await db["detected_gaps_snapshot"].replace_one(
+            {"name": "current"},
+            {
+                "name": "current",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "total_gaps": 0,
+                "new_gaps_saved": 0,
+                "detected_gaps": [],
+            },
+            upsert=True,
+        )
         return {
             "message": "All gaps cleared",
             "deleted_count": result.deleted_count

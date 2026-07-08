@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -19,11 +19,19 @@ class FakeCursor:
     def __init__(self, docs=None):
         self.docs = list(docs or [])
 
+    async def create_index(self, keys, **kwargs):
+        return "index"
+
     def find(self, *args, **kwargs):
         return self
 
     async def to_list(self, limit):
         return self.docs[:limit]
+
+    async def count_documents(self, query):
+        if not query:
+            return len(self.docs)
+        return sum(1 for doc in self.docs if all(doc.get(k) == v for k, v in query.items()))
 
     async def delete_many(self, query):
         deleted = len(self.docs)
@@ -56,6 +64,34 @@ class FakeCursor:
         self.docs.extend(docs)
         return type("InsertResult", (), {"inserted_ids": list(range(len(docs)))})()
 
+    async def bulk_write(self, operations, ordered=False):
+        for operation in operations:
+            query = operation._filter
+            update = operation._doc.get("$set", {})
+            existing = None
+            for index, doc in enumerate(self.docs):
+                if all(doc.get(k) == v for k, v in query.items()):
+                    existing = index
+                    break
+            if existing is None:
+                self.docs.append({**query, **update})
+            else:
+                self.docs[existing] = {**self.docs[existing], **update}
+        return type("BulkWriteResult", (), {"upserted_count": len(operations), "modified_count": 0})()
+
+    async def replace_one(self, query, replacement, upsert=False):
+        existing = None
+        for index, doc in enumerate(self.docs):
+            if all(doc.get(k) == v for k, v in query.items()):
+                existing = index
+                break
+        if existing is None:
+            if upsert:
+                self.docs.append(replacement)
+            return type("Result", (), {"upserted_id": "new"})()
+        self.docs[existing] = replacement
+        return type("Result", (), {"modified_count": 1})()
+
     async def find_one(self, query):
         for doc in self.docs:
             if all(doc.get(k) == v for k, v in query.items()):
@@ -70,6 +106,7 @@ class FakeDb:
         self.collections = {
             "timesheet_entries": self.timesheets,
             "detected_gaps": self.gaps,
+            "detected_gaps_snapshot": FakeCursor([]),
         }
 
     def __getitem__(self, key):
@@ -83,6 +120,35 @@ class Phase3ApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
         self.fake_db = FakeDb()
+
+    def test_health_endpoint_reports_ready_state(self):
+        with patch("src.main.db.list_collection_names", new=AsyncMock(return_value=["timesheet_entries"])):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ready"])
+        self.assertEqual(body["database"]["status"], "connected")
+
+    def test_startup_initializes_indexes(self):
+        fake_db = FakeDb()
+        fake_db.collections["activity_logs"] = FakeCursor([])
+        fake_db.collections["timesheet_entries"] = FakeCursor([])
+        fake_db.collections["detected_gaps"] = FakeCursor([])
+        with patch("src.main.db", fake_db):
+            with TestClient(app):
+                pass
+
+        self.assertTrue(hasattr(fake_db.collections["activity_logs"], "create_index"))
+
+    def test_detected_gaps_endpoint_uses_cached_response(self):
+        with patch("src.main.run_gap_detection", new=AsyncMock(return_value={"total_gaps": 1, "new_gaps_saved": 1, "detected_gaps": []})) as run_mock:
+            first = self.client.get("/detected_gaps")
+            second = self.client.get("/detected_gaps")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(run_mock.await_count, 1)
 
     def test_upsert_timesheets_endpoint_normalizes_fields(self):
         with patch("src.main.db", self.fake_db):
@@ -127,6 +193,25 @@ class Phase3ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["new_total_gaps"], 1)
         self.assertEqual(response.json()["new_gaps_saved"], 1)
+
+    def test_refresh_gaps_endpoint_computes_new_count_from_existing_keys(self):
+        self.fake_db.gaps.docs = [{"developer_id": "JANE DOE", "date": "2026-07-01", "reason": "existing"}]
+        detection_result = {
+            "total_gaps": 1,
+            "new_gaps_saved": 1,
+            "detected_gaps": [{"developer_id": "JANE DOE", "date": "2026-07-01", "reason": "existing"}],
+        }
+
+        with patch("src.main.db", self.fake_db), patch("src.main.run_gap_detection", new=AsyncMock(return_value=detection_result)):
+            first = self.client.post("/refresh_gaps")
+            second = self.client.post("/refresh_gaps")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()["new_count"], 0)
+        self.assertEqual(first.json()["total_count"], 1)
+        self.assertEqual(second.json()["new_count"], 0)
+        self.assertEqual(second.json()["total_count"], 1)
 
     def test_classify_gap_endpoint_returns_classification(self):
         with patch("src.main.generate_gap_priority", return_value="High priority: missing timesheet"), patch("src.main.db", self.fake_db):

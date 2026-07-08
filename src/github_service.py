@@ -1,4 +1,5 @@
 import httpx
+from pymongo import UpdateOne
 
 from .activity_utils import normalize_activity_date, normalize_developer_id
 from .config import get_settings
@@ -44,6 +45,7 @@ async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
                 break
 
             total_fetched += len(commits)
+            operations: list[UpdateOne] = []
 
             for commit in commits:
                 commit_data = commit.get("commit", {})
@@ -55,27 +57,36 @@ async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
                 if not commit_id:
                     continue
 
-                result = await db.activity_logs.update_one(
-                    {"source": "github", "activity_type": "commit", "commit_id": commit_id},
-                    {
-                        "$set": {
-                            "developer_id": normalize_developer_id(developer_name),
-                            "developer_name": developer_name,
-                            "source": "github",
-                            "activity_type": "commit",
-                            "commit_id": commit_id,
-                            "message": commit_data.get("message"),
-                            "author": author_data.get("name", "Unknown"),
-                            "timestamp": timestamp,
-                            "date": normalize_activity_date(timestamp),
-                            "project": repo_name,
-                            "repo_owner": repo_owner,
-                        }
-                    },
-                    upsert=True,
+                operations.append(
+                    UpdateOne(
+                        {"source": "github", "activity_type": "commit", "commit_id": commit_id},
+                        {
+                            "$set": {
+                                "developer_id": normalize_developer_id(developer_name),
+                                "developer_name": developer_name,
+                                "source": "github",
+                                "activity_type": "commit",
+                                "commit_id": commit_id,
+                                "message": commit_data.get("message"),
+                                "author": author_data.get("name", "Unknown"),
+                                "timestamp": timestamp,
+                                "date": normalize_activity_date(timestamp),
+                                "project": repo_name,
+                                "repo_owner": repo_owner,
+                            }
+                        },
+                        upsert=True,
+                    )
                 )
-                if result.upserted_id or result.modified_count:
-                    count += 1
+
+                if len(operations) >= 100:
+                    result = await db.activity_logs.bulk_write(operations, ordered=False)
+                    count += (result.upserted_count or 0) + (result.modified_count or 0)
+                    operations.clear()
+
+            if operations:
+                result = await db.activity_logs.bulk_write(operations, ordered=False)
+                count += (result.upserted_count or 0) + (result.modified_count or 0)
 
             if len(commits) < 100:
                 break

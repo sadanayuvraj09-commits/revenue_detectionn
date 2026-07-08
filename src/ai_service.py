@@ -22,11 +22,14 @@ def _get_gemini_client():
 gemini_client = _get_gemini_client()
 
 
-def _call_gemini(prompt: str, max_retries: int = 3) -> str | None:
+def _call_gemini(prompt: str, max_retries: int | None = None) -> str | None:
     if gemini_client is None:
         return None
 
-    for attempt in range(1, max_retries + 1):
+    effective_retries = max(1, int(max_retries or os.getenv("AI_MAX_RETRIES", "1")))
+    retry_delay = max(0.0, float(os.getenv("AI_RETRY_DELAY_SECONDS", "0")))
+
+    for attempt in range(1, effective_retries + 1):
         try:
             response = gemini_client.models.generate_content(
                 model="gemini-2.5-flash-lite",
@@ -34,9 +37,10 @@ def _call_gemini(prompt: str, max_retries: int = 3) -> str | None:
             )
             return response.text.strip()
         except Exception:
-            if attempt == max_retries:
+            if attempt == effective_retries:
                 return None
-            time.sleep(5 * attempt)
+            if retry_delay > 0:
+                time.sleep(retry_delay)
     return None
 
 
