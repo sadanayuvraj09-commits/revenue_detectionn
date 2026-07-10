@@ -1,7 +1,7 @@
 import httpx
 from pymongo import UpdateOne
 
-from .activity_utils import normalize_activity_date, normalize_developer_id
+from .activity_utils import normalize_activity_date, resolve_developer_id
 from .config import get_settings
 from .database import db
 
@@ -62,7 +62,7 @@ async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
                         {"source": "github", "activity_type": "commit", "commit_id": commit_id},
                         {
                             "$set": {
-                                "developer_id": normalize_developer_id(developer_name),
+                                "developer_id": resolve_developer_id(developer_name),
                                 "developer_name": developer_name,
                                 "source": "github",
                                 "activity_type": "commit",

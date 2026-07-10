@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - fallback for minimal environments
 
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 
-from .activity_utils import normalize_activity_date, normalize_developer_id
+from .activity_utils import normalize_activity_date, normalize_developer_id, resolve_developer_id
 from .ai_service import (
     answer_gap_question,
     generate_ai_summary,
@@ -142,7 +142,7 @@ def validate_timesheet_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="hours_logged must be a number") from exc
 
     return {
-        "developer_id": normalize_developer_id(entry["developer_id"]),
+        "developer_id": resolve_developer_id(entry["developer_id"]),
         "date": normalized_date,
         "hours_logged": hours_logged,
         "project": entry.get("project"),
@@ -168,7 +168,7 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
 
     ts_lookup = {
         (
-            normalize_developer_id(ts.get("developer_id")),
+            resolve_developer_id(ts.get("developer_id")),
             normalize_activity_date(ts.get("date")),
         ): ts
         for ts in timesheets
@@ -744,7 +744,13 @@ async def refresh_gaps():
             if gap.get("developer_id") is not None and gap.get("date") is not None
         }
         new_count = len(new_keys - existing_keys)
-        total_count = await db["detected_gaps"].count_documents({})
+
+        # delete gaps that are no longer active
+        await db["detected_gaps"].delete_many({
+            "$nor": [{"developer_id": k[0], "date": k[1]} for k in new_keys]
+        } if new_keys else {})
+
+        total_count = len(detected_gaps)
 
         await db["detected_gaps_snapshot"].replace_one(
             {"name": "current"},

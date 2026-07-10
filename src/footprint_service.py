@@ -1,7 +1,7 @@
 from collections import Counter, defaultdict
 from typing import Any
 
-from .activity_utils import normalize_activity_date, normalize_developer_id
+from .activity_utils import normalize_activity_date, normalize_developer_id, resolve_developer_id
 from .database import db
 
 
@@ -67,7 +67,7 @@ async def build_all_footprints(limit: int = 5000) -> list[dict[str, Any]]:
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for activity in activities:
-        developer_id = normalize_developer_id(activity.get("developer_id"))
+        developer_id = resolve_developer_id(activity.get("developer_id"))
         date = normalize_activity_date(activity.get("date") or activity.get("timestamp"))
         if date == "UNKNOWN":
             continue

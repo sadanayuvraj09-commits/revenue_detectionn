@@ -9,6 +9,17 @@ def normalize_developer_id(value: Any) -> str:
     return normalized or "UNKNOWN"
 
 
+DEVELOPER_ALIASES = {
+    "YUVRAJ": "YUVRAJ SADANA",
+    "YUVRAJ SADANA": "YUVRAJ SADANA",
+}
+
+
+def resolve_developer_id(value: Any) -> str:
+    normalized = normalize_developer_id(value)
+    return DEVELOPER_ALIASES.get(normalized, normalized)
+
+
 def normalize_activity_date(value: Any) -> str:
     if value is None:
         return "UNKNOWN"
