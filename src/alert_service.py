@@ -182,7 +182,7 @@ async def send_email_notification(alert: dict[str, Any], recipient: str) -> bool
     Returns:
         True if sent successfully, False otherwise
     """
-    api_key = os.getenv("RESEND_API_KEY")
+    api_key = os.getenv("SENDGRID_API_KEY")
     email_from = os.getenv("EMAIL_FROM")
 
     if not api_key or not email_from:
@@ -196,15 +196,17 @@ async def send_email_notification(alert: dict[str, Any], recipient: str) -> bool
     )
 
     try:
-        import resend
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
 
-        resend.api_key = api_key
-        resend.Emails.send({
-            "from": email_from,
-            "to": [recipient],
-            "subject": subject,
-            "text": body,
-        })
+        message = Mail(
+            from_email=email_from,
+            to_emails=recipient,
+            subject=subject,
+            plain_text_content=body,
+        )
+        sg = SendGridAPIClient(api_key)
+        sg.send(message)
         return True
     except Exception as e:
         print(f"Failed to send email notification: {e}")
