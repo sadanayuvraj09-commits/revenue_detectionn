@@ -9,7 +9,7 @@ Run:
     1) uvicorn src.main:app --reload --port 8001   (in one terminal)
     2) streamlit run dashboard.py                   (in another terminal)
 """
-
+import os
 import requests
 import streamlit as st
 import pandas as pd
@@ -25,7 +25,10 @@ st.set_page_config(
 # Sidebar — connection settings + nav
 # ---------------------------------------------------------------------------
 st.sidebar.title("🕵️ Unbilled Revenue Detective")
-base_url = st.sidebar.text_input("Backend URL", value="http://127.0.0.1:8001")
+base_url = st.sidebar.text_input(
+    "Backend URL",
+    value=os.getenv("BACKEND_URL", "http://127.0.0.1:8001"),
+)
 api_key = st.sidebar.text_input(
     "API Key (x-api-key)", type="password",
     help="Needed for protected endpoints: add timesheets, clear gaps, analyze & alert, fetch commits."
