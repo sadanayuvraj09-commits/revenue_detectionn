@@ -408,7 +408,12 @@ elif page == "Gaps":
             if st.button("📋 Classify Priority"):
                 result = api_post("/classify_gap", json=gap, timeout=90)
                 if result:
-                    st.info(priority_badge(result.get("classification")))
+                    classification = result.get("classification", "")
+                    if ":" in classification:
+                        label, reasoning = classification.split(":", 1)
+                        st.markdown(f"**Priority: {priority_badge(label.strip())}**\n\n{reasoning.strip()}")
+                    else:
+                        st.markdown(priority_badge(classification))
         with c2:
             if st.button("✍️ Suggest Timesheet Entry"):
                 result = api_post("/suggest_timesheet", json=gap, timeout=90)
@@ -424,8 +429,7 @@ elif page == "Gaps":
             if st.button("🔗 Match to Project"):
                 result = api_post("/match_activity", json=gap, timeout=90)
                 if result:
-                    st.info(result.get("match"))
-
+                    st.markdown(f"**Matched Project**\n\n{result.get('match', 'No match found.')}")
         st.divider()
         st.subheader("Send an alert for this gap")
         recipient_email = st.text_input("Recipient email (optional — blank skips email, Slack always fires)")
@@ -564,7 +568,7 @@ elif page == "Ask AI":
                 payload = {**gap, "question": question}
                 result = api_post("/ask", json=payload, timeout=90)
                 if result:
-                    st.success(result.get("answer"))
+                    st.markdown(f"**Answer**\n\n{result.get('answer', 'No answer returned.')}")
 
 # ===========================================================================
 # SYSTEM HEALTH
