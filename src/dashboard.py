@@ -174,7 +174,7 @@ if page == "Overview":
 
     with col2:
         st.subheader("🤖 Summarize pending gaps")
-        st.write("Runs Gemini over all pending gaps.")
+        sst.write("Runs Groq over all pending gaps.")
         if st.button("Summarize Pending Gaps", use_container_width=True):
             with st.spinner("Summarizing pending gaps — this can take a while..."):
                 result = api_get("/summarize_gaps", timeout=900)

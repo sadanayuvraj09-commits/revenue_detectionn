@@ -378,7 +378,7 @@ async def get_commits(limit: int = Query(default=100, ge=1, le=1000)):
     return {"commits": [serialize_doc(c) for c in commits]}
 
 
-@app.post("/fetch_slack_messages")
+@app.post("/fetch_slack_messages", dependencies=[Depends(verify_api_key)])
 async def fetch_slack_messages_endpoint(
     start_date: str | None = Query(default=None),
     end_date: str | None = Query(default=None),
@@ -412,7 +412,7 @@ async def get_slack_activity(limit: int = Query(default=100, ge=1, le=1000)):
     return {"slack_activity": [serialize_doc(message) for message in messages]}
 
 
-@app.post("/fetch_jira_updates")
+@app.post("/fetch_jira_updates", dependencies=[Depends(verify_api_key)])
 async def fetch_jira_updates_endpoint(
     start_date: str | None = Query(default=None),
     end_date: str | None = Query(default=None),
@@ -499,7 +499,7 @@ async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Bod
     return {"inserted": inserted, "updated": updated, "total": len(entries)}
 
 
-@app.put("/timesheets/{developer_id}/{date}")
+@app.put("/timesheets/{developer_id}/{date}", dependencies=[Depends(verify_api_key)])
 async def update_timesheet(
     developer_id: str,
     date: str,
@@ -546,7 +546,7 @@ async def update_timesheet(
         raise HTTPException(status_code=500, detail=f"Failed to update timesheet: {exc}") from exc
 
 
-@app.delete("/timesheets/{developer_id}/{date}")
+@app.delete("/timesheets/{developer_id}/{date}", dependencies=[Depends(verify_api_key)])
 async def delete_timesheet(developer_id: str, date: str):
     normalized_date = normalize_activity_date(date)
     normalized_developer = normalize_developer_id(developer_id)
@@ -648,7 +648,7 @@ async def summarize_gaps():
     return {"message": f"Summarized {len(updated)} gaps.", "updated": updated}
 
 
-@app.post("/classify_gap")
+@app.post("/classify_gap", dependencies=[Depends(verify_api_key)])
 async def classify_gap(payload: dict[str, Any] = Body(...)):
     try:
         classification = generate_gap_priority(payload)
@@ -670,7 +670,7 @@ async def classify_gap(payload: dict[str, Any] = Body(...)):
         raise HTTPException(status_code=500, detail=f"Failed to classify gap: {exc}") from exc
 
 
-@app.post("/suggest_timesheet")
+@app.post("/suggest_timesheet", dependencies=[Depends(verify_api_key)])
 async def suggest_timesheet(payload: dict[str, Any] = Body(...)):
     try:
         return {"suggested_timesheet": suggest_timesheet_entry(payload)}
@@ -678,7 +678,7 @@ async def suggest_timesheet(payload: dict[str, Any] = Body(...)):
         raise HTTPException(status_code=500, detail=f"Failed to suggest timesheet: {exc}") from exc
 
 
-@app.post("/match_activity")
+@app.post("/match_activity", dependencies=[Depends(verify_api_key)])
 async def match_activity(payload: dict[str, Any] = Body(...)):
     try:
         developer_id = normalize_developer_id(payload.get("developer_id", ""))
@@ -709,7 +709,7 @@ async def match_activity(payload: dict[str, Any] = Body(...)):
         raise HTTPException(status_code=500, detail=f"Failed to match activity: {exc}") from exc
 
 
-@app.post("/ask")
+@app.post("/ask", dependencies=[Depends(verify_api_key)])
 async def ask_question(payload: dict[str, Any] = Body(...)):
     question = payload.get("question")
     if not question:
@@ -736,7 +736,7 @@ async def check_gaps(limit: int = Query(default=100, ge=1, le=1000)):
     return {"gaps": [serialize_doc(g) for g in gaps]}
 
 
-@app.post("/refresh_gaps")
+@app.post("/refresh_gaps", dependencies=[Depends(verify_api_key)])
 async def refresh_gaps():
     """Re-run gap detection and compare new detected gaps against the existing collection."""
     try:
@@ -822,7 +822,7 @@ async def clear_gaps():
         ) from exc
 
 
-@app.post("/import_timesheets")
+@app.post("/import_timesheets", dependencies=[Depends(verify_api_key)])
 async def import_timesheets_csv(file: UploadFile = File(...)):
     """Accept a CSV upload and upsert timesheet entries into MongoDB."""
     import csv
@@ -997,7 +997,7 @@ async def get_alert_history_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to fetch alert history: {exc}") from exc
 
 
-@app.post("/alerts/{alert_id}/mark_notified")
+@app.post("/alerts/{alert_id}/mark_notified", dependencies=[Depends(verify_api_key)])
 async def mark_alert_notified_endpoint(alert_id: str):
     """Mark an alert as notified."""
     try:
@@ -1011,7 +1011,7 @@ async def mark_alert_notified_endpoint(alert_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to mark alert: {exc}") from exc
 
 
-@app.post("/alerts/{alert_id}/resolve")
+@app.post("/alerts/{alert_id}/resolve", dependencies=[Depends(verify_api_key)])
 async def resolve_alert_endpoint(
     alert_id: str,
     payload: dict[str, Any] = Body(default={})
