@@ -26,40 +26,6 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 
 st.sidebar.title("🕵️ Unbilled Revenue Detective")
-
-# Fixed backend — not shown to regular employees. Set BACKEND_URL as a
-# Streamlit secret/env var to override without touching code.
-DEFAULT_BACKEND_URL = "https://revenue-detectionn.onrender.com"
-base_url = os.getenv("BACKEND_URL", DEFAULT_BACKEND_URL)
-
-api_key = st.sidebar.text_input(
-    "API Key (x-api-key)", type="password",
-    help="Needed for protected endpoints: add timesheets, clear gaps, analyze & alert, fetch commits."
-)
-
-is_manager = bool(api_key)
-
-if is_manager:
-    st.sidebar.success("Manager mode — full access")
-    # Backend URL override, only visible/editable by managers, collapsed by default.
-    with st.sidebar.expander("Advanced settings"):
-        base_url = st.text_input("Backend URL override", value=base_url)
-    page = st.sidebar.radio(
-        "Navigate",
-        ["Overview", "Data Sync", "Timesheets", "Gaps", "Developers", "Alerts", "Ask AI", "System Health"],
-    )
-else:
-    st.sidebar.info("Employee mode — enter the API key above for manager access")
-    page = st.sidebar.radio(
-        "Navigate",
-        ["My Timesheet"],
-    )
-
-st.sidebar.divider()
-
-# ---------------------------------------------------------------------------
-# API helpers
-# ---------------------------------------------------------------------------
 def headers():
     h = {"Content-Type": "application/json"}
     if api_key:
@@ -129,6 +95,87 @@ def api_delete(path):
     except requests.exceptions.RequestException as e:
         st.error(f"Could not reach backend at {base_url}. Is the server running?\n\n{e}")
         return None
+
+# Fixed backend — not shown to regular employees. Set BACKEND_URL as a
+# Streamlit secret/env var to override without touching code.
+DEFAULT_BACKEND_URL = "https://revenue-detectionn.onrender.com"
+base_url = os.getenv("BACKEND_URL", DEFAULT_BACKEND_URL)
+
+api_key = st.sidebar.text_input(
+    "API Key (x-api-key)", type="password",
+    help="Needed for protected endpoints: add timesheets, clear gaps, analyze & alert, fetch commits."
+)
+
+is_manager = bool(api_key)
+
+if is_manager:
+    st.sidebar.success("Manager mode — full access")
+    # Backend URL override, only visible/editable by managers, collapsed by default.
+    with st.sidebar.expander("Advanced settings"):
+        base_url = st.text_input("Backend URL override", value=base_url)
+
+    # --- Project picker -----------------------------------------------
+    st.sidebar.divider()
+    st.sidebar.subheader("📁 Project")
+
+    projects_data = api_get("/projects")
+    projects_list = projects_data.get("projects", []) if projects_data else []
+
+    if projects_list:
+        project_labels = [
+            f"{p.get('owner')}/{p.get('repo')}" + (" (active)" if p.get("is_active") else "")
+            for p in projects_list
+        ]
+        default_index = next(
+            (i for i, p in enumerate(projects_list) if p.get("is_active")), 0
+        )
+        chosen_project_label = st.sidebar.selectbox(
+            "Active project", project_labels, index=default_index
+        )
+        chosen_project = projects_list[project_labels.index(chosen_project_label)]
+
+        if not chosen_project.get("is_active"):
+            if st.sidebar.button("Set as active"):
+                result = api_post(f"/projects/{chosen_project['repo_id']}/activate")
+                if result:
+                    st.sidebar.success(f"Activated {chosen_project_label}")
+                    st.rerun()
+    else:
+        st.sidebar.caption("No projects registered yet.")
+
+    with st.sidebar.expander("➕ Register new project"):
+        new_owner = st.text_input("GitHub owner", key="new_project_owner")
+        new_repo = st.text_input("GitHub repo", key="new_project_repo")
+        if st.button("Register project", key="register_project_btn"):
+            if not new_owner or not new_repo:
+                st.sidebar.warning("Owner and repo are required.")
+            else:
+                result = api_post(
+                    "/projects",
+                    json={"owner": new_owner, "repo": new_repo, "make_active": True},
+                )
+                if result:
+                    st.sidebar.success(f"Registered {new_owner}/{new_repo}")
+                    st.rerun()
+    # --------------------------------------------------------------------
+
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Overview", "Data Sync", "Timesheets", "Gaps", "Developers", "Alerts", "Ask AI", "System Health"],
+    )
+else:
+    st.sidebar.info("Employee mode — enter the API key above for manager access")
+    page = st.sidebar.radio(
+        "Navigate",
+        ["My Timesheet"],
+    )
+
+st.sidebar.divider()
+
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
+
 
 
 PRIORITY_EMOJI = {"high": "🔴", "medium": "🟡", "low": "🟢"}
