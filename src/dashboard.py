@@ -26,10 +26,23 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 
 st.sidebar.title("🕵️ Unbilled Revenue Detective")
+
+# ---------------------------------------------------------------------------
+# Auth — real per-user accounts. Nothing below this gate is shown, and no
+# API calls are made, until the person is logged in. Every subsequent
+# request carries their personal JWT, so the backend only ever returns
+# *their* projects, commits, timesheets, and gaps — never anyone else's.
+# ---------------------------------------------------------------------------
+
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
+    st.session_state.user_email = None
+
+
 def headers():
     h = {"Content-Type": "application/json"}
-    if api_key:
-        h["x-api-key"] = api_key
+    if st.session_state.access_token:
+        h["Authorization"] = f"Bearer {st.session_state.access_token}"
     return h
 
 
@@ -46,9 +59,9 @@ def api_get(path, params=None, timeout=200):
 
 
 @st.cache_data(ttl=300)
-def get_developers_cached(base_url_value, api_key_value):
+def get_developers_cached(base_url_value, token_value):
     try:
-        r = requests.get(f"{base_url_value}/developers", headers={"Content-Type": "application/json", **({"x-api-key": api_key_value} if api_key_value else {})}, timeout=200)
+        r = requests.get(f"{base_url_value}/developers", headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {token_value}"} if token_value else {})}, timeout=200)
         if r.status_code >= 400:
             return None
         return r.json()
@@ -101,18 +114,63 @@ def api_delete(path):
 DEFAULT_BACKEND_URL = "https://revenue-detectionn.onrender.com"
 base_url = os.getenv("BACKEND_URL", DEFAULT_BACKEND_URL)
 
-api_key = st.sidebar.text_input(
-    "API Key (x-api-key)", type="password",
-    help="Needed for protected endpoints: add timesheets, clear gaps, analyze & alert, fetch commits."
-)
+if not st.session_state.access_token:
+    st.sidebar.subheader("🔐 Log in")
+    with st.sidebar.expander("Advanced settings"):
+        base_url = st.text_input("Backend URL override", value=base_url, key="backend_url_prelogin")
 
-is_manager = bool(api_key)
+    auth_tab_login, auth_tab_signup = st.sidebar.tabs(["Log in", "Sign up"])
+
+    with auth_tab_login:
+        login_email = st.text_input("Email", key="login_email")
+        login_password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Log in", key="login_button"):
+            try:
+                r = requests.post(f"{base_url}/auth/login", json={"email": login_email, "password": login_password}, timeout=20)
+                if r.status_code >= 400:
+                    st.sidebar.error(f"Login failed: {r.json().get('detail', r.text)}")
+                else:
+                    data = r.json()
+                    st.session_state.access_token = data["access_token"]
+                    st.session_state.user_email = data["email"]
+                    st.rerun()
+            except requests.exceptions.RequestException as e:
+                st.sidebar.error(f"Could not reach backend at {base_url}. Is the server running?\n\n{e}")
+
+    with auth_tab_signup:
+        signup_email = st.text_input("Email", key="signup_email")
+        signup_password = st.text_input("Password (min 8 characters)", type="password", key="signup_password")
+        if st.button("Create account", key="signup_button"):
+            try:
+                r = requests.post(f"{base_url}/auth/signup", json={"email": signup_email, "password": signup_password}, timeout=20)
+                if r.status_code >= 400:
+                    st.sidebar.error(f"Sign up failed: {r.json().get('detail', r.text)}")
+                else:
+                    data = r.json()
+                    st.session_state.access_token = data["access_token"]
+                    st.session_state.user_email = data["email"]
+                    st.rerun()
+            except requests.exceptions.RequestException as e:
+                st.sidebar.error(f"Could not reach backend at {base_url}. Is the server running?\n\n{e}")
+
+    st.title("🕵️ Unbilled Revenue Detective")
+    st.info("Log in or create an account in the sidebar to see your own projects, commits, and gaps. Nobody else's data is visible to you, and yours isn't visible to them.")
+    st.stop()
+
+# --- Logged in from here on ------------------------------------------------
+is_manager = True  # any logged-in user has full access to their own data
+
+st.sidebar.success(f"Logged in as {st.session_state.user_email}")
+if st.sidebar.button("Log out"):
+    st.session_state.access_token = None
+    st.session_state.user_email = None
+    st.rerun()
+
+# Backend URL override, collapsed by default.
+with st.sidebar.expander("Advanced settings"):
+    base_url = st.text_input("Backend URL override", value=base_url)
 
 if is_manager:
-    st.sidebar.success("Manager mode — full access")
-    # Backend URL override, only visible/editable by managers, collapsed by default.
-    with st.sidebar.expander("Advanced settings"):
-        base_url = st.text_input("Backend URL override", value=base_url)
 
     # --- Project picker -----------------------------------------------
     st.sidebar.divider()
@@ -212,7 +270,7 @@ if page == "Overview":
         del st.session_state["overview_refresh_message"] 
 
     gaps_data = api_get("/detected_gaps")
-    devs_data = get_developers_cached(base_url, api_key)
+    devs_data = get_developers_cached(base_url, st.session_state.access_token)
     alerts_data = api_get("/alerts/pending")
 
     gaps = gaps_data.get("detected_gaps", []) if gaps_data else []
@@ -528,7 +586,7 @@ elif page == "Developers":
     st.title("Developers")
     st.caption("Activity footprint vs. logged timesheet, side by side.")
 
-    devs_data = get_developers_cached(base_url, api_key)
+    devs_data = get_developers_cached(base_url, st.session_state.access_token)
     devs = devs_data.get("developers", []) if devs_data else []
 
     if not devs:
@@ -652,7 +710,7 @@ elif page == "System Health":
 
     st.divider()
     st.write("**Connected to:**", base_url)
-    st.write("**API key set:**", "Yes" if api_key else "No (some endpoints will fail with 401)")
+    st.write("**Logged in as:**", st.session_state.user_email)
     # ===========================================================================
 # MY TIMESHEET (employee self-service, no API key required)
 # ===========================================================================

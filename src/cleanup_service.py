@@ -25,18 +25,27 @@ SCOPED_COLLECTIONS = [
 ]
 
 
-async def purge_project_data(repo_id: str, delete_project_record: bool = True) -> dict[str, Any]:
-    """Cascade-delete every document scoped to this repo_id, across all
-    collections, plus the project record itself (unless keeping it as
-    an empty placeholder is desired)."""
+async def purge_project_data(repo_id: str, user_id: str | None = None, delete_project_record: bool = True) -> dict[str, Any]:
+    """Cascade-delete every document scoped to this repo_id (and, when
+    provided, this user_id — so deleting your project never touches
+    another user's data on that same repo), across all collections,
+    plus the project record itself (unless keeping it as an empty
+    placeholder is desired)."""
     deleted_counts: dict[str, int] = {}
 
+    query: dict[str, Any] = {"repo_id": repo_id}
+    if user_id:
+        query["user_id"] = user_id
+
     for collection_name in SCOPED_COLLECTIONS:
-        result = await db[collection_name].delete_many({"repo_id": repo_id})
+        result = await db[collection_name].delete_many(query)
         deleted_counts[collection_name] = result.deleted_count
 
     if delete_project_record:
-        await db["projects"].delete_one({"repo_id": repo_id})
+        project_query: dict[str, Any] = {"repo_id": repo_id}
+        if user_id:
+            project_query["user_id"] = user_id
+        await db["projects"].delete_one(project_query)
 
     return {"repo_id": repo_id, "deleted": deleted_counts}
 
@@ -62,7 +71,7 @@ async def cleanup_stale_projects(stale_after_days: int = 30) -> dict[str, Any]:
         repo_id = project.get("repo_id")
         if not repo_id:
             continue
-        result = await purge_project_data(repo_id)
+        result = await purge_project_data(repo_id, user_id=project.get("user_id"))
         purged.append(result)
 
     return {"stale_after_days": stale_after_days, "projects_purged": len(purged), "details": purged}

@@ -1,43 +1,42 @@
-import asyncio
+mport asyncio
 import hashlib
 import json
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 from pymongo import UpdateOne
-
+ 
 from .alert_service import (
     generate_alert,
     send_slack_notification,
     send_email_notification,
     resolve_alert_recipient_email,   # NEW
 )
-
+ 
 from .timesheet_stub_service import generate_timesheet_stubs
 from .alias_service import load_developer_aliases, add_developer_alias, list_developer_aliases
-from .project_service import get_active_project  # already added in Step 2
 from .cleanup_service import purge_project_data, cleanup_stale_projects
-
+ 
 from .activity_utils import normalize_repo_id
-
+ 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 except ImportError:  # pragma: no cover - fallback for minimal environments
     class AsyncIOScheduler:  # type: ignore[no-redef]
         def __init__(self) -> None:
             self.running = False
-
+ 
         def add_job(self, *args: Any, **kwargs: Any) -> None:
             return None
-
+ 
         def start(self) -> None:
             self.running = True
-
+ 
         def shutdown(self) -> None:
             self.running = False
-
+ 
 from fastapi import Body, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
-
+ 
 from .activity_utils import normalize_activity_date, normalize_developer_id, resolve_developer_id
 from .ai_service import (
     answer_gap_question,
@@ -55,6 +54,7 @@ from .alert_service import (
     send_email_notification,
     send_slack_notification,
 )
+from . import auth_service
 from .config import get_settings
 from .database import db
 from .footprint_service import ACTIVITY_SOURCES, build_all_footprints, build_developer_footprint
@@ -68,8 +68,8 @@ from .project_service import (
 )
 from .jira_service import fetch_jira_updates
 from .slack_service import fetch_slack_messages
-
-
+ 
+ 
 # Timesheet document schema in MongoDB collection: timesheet_entries
 # {
 #     "developer_id": str,       # Required. Must match activity_logs.developer_id exactly.
@@ -78,11 +78,11 @@ from .slack_service import fetch_slack_messages
 #     "project": str,            # Optional.
 #     "notes": str,              # Optional.
 # }
-
+ 
 settings = get_settings()
 app = FastAPI(title="Unbilled Revenue Detective API")
 scheduler = AsyncIOScheduler()
-
+ 
 _gap_detection_cache: dict[int, dict[str, Any]] = {}
 _gap_detection_cache_lock = asyncio.Lock()
 _gap_detection_cache_ttl_seconds = 30
@@ -90,28 +90,28 @@ _gap_detection_cache_timestamp: float | None = None
 _detected_gaps_response_cache: dict[int, dict[str, Any]] = {}
 _detected_gaps_response_cache_lock = asyncio.Lock()
 _detected_gaps_response_cache_timestamp: float | None = None
-
-
+ 
+ 
 def invalidate_gap_detection_cache() -> None:
     global _gap_detection_cache_timestamp, _detected_gaps_response_cache_timestamp
     _gap_detection_cache.clear()
     _gap_detection_cache_timestamp = None
     _detected_gaps_response_cache.clear()
     _detected_gaps_response_cache_timestamp = None
-
-
+ 
+ 
 def _gap_detection_cache_is_valid() -> bool:
     if _gap_detection_cache_timestamp is None:
         return False
     return (datetime.now(timezone.utc).timestamp() - _gap_detection_cache_timestamp) < _gap_detection_cache_ttl_seconds
-
-
+ 
+ 
 def _detected_gaps_response_cache_is_valid() -> bool:
     if _detected_gaps_response_cache_timestamp is None:
         return False
     return (datetime.now(timezone.utc).timestamp() - _detected_gaps_response_cache_timestamp) < _gap_detection_cache_ttl_seconds
-
-
+ 
+ 
 def _fingerprint_docs(docs: list[dict[str, Any]]) -> str:
     normalized = []
     for doc in docs:
@@ -123,8 +123,8 @@ def _fingerprint_docs(docs: list[dict[str, Any]]) -> str:
         )
     payload = json.dumps(normalized, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
+ 
+ 
 async def verify_api_key(x_api_key: str | None = Header(default=None)):
     import os
     expected_key = os.getenv("API_KEY", "").strip()
@@ -132,23 +132,39 @@ async def verify_api_key(x_api_key: str | None = Header(default=None)):
         return  # No API_KEY configured on the backend — protection is off entirely
     if x_api_key is None or x_api_key != expected_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
+ 
 def serialize_doc(doc: dict[str, Any]) -> dict[str, Any]:
     doc["_id"] = str(doc["_id"])
     return doc
-
-
+ 
+ 
+@app.post("/auth/signup")
+async def auth_signup(payload: dict[str, Any] = Body(...)):
+    return await auth_service.signup(
+        email=payload.get("email", ""),
+        password=payload.get("password", ""),
+    )
+ 
+ 
+@app.post("/auth/login")
+async def auth_login(payload: dict[str, Any] = Body(...)):
+    return await auth_service.login(
+        email=payload.get("email", ""),
+        password=payload.get("password", ""),
+    )
+ 
+ 
 async def get_activity_count(developer_id: str, date: str, source: str) -> int:
     footprint = await build_developer_footprint(developer_id, date)
     return footprint.get(f"{source}_count", 0)
-
-
+ 
+ 
 def validate_timesheet_entry(entry: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
     required_fields = ["developer_id", "date", "hours_logged"]
     for field in required_fields:
         if field not in entry or entry.get(field) in (None, ""):
             raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-
+ 
     normalized_date = normalize_activity_date(entry["date"])
     try:
         datetime.strptime(normalized_date, "%Y-%m-%d")
@@ -156,12 +172,12 @@ def validate_timesheet_entry(entry: dict[str, Any], aliases: dict[str, str] | No
         raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
     if normalized_date == "UNKNOWN":
         raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
-
+ 
     try:
         hours_logged = float(entry["hours_logged"])
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="hours_logged must be a number") from exc
-
+ 
     return {
         "developer_id": resolve_developer_id(entry["developer_id"], aliases),  # CHANGED
         "date": normalized_date,
@@ -169,26 +185,26 @@ def validate_timesheet_entry(entry: dict[str, Any], aliases: dict[str, str] | No
         "project": entry.get("project"),
         "notes": entry.get("notes"),
     }
-
-async def run_gap_detection(limit: int = 5000, repo_id: str | None = None) -> dict[str, Any]:
+ 
+async def run_gap_detection(user_id: str, limit: int = 5000, repo_id: str | None = None) -> dict[str, Any]:
     global _gap_detection_cache_timestamp
-
+ 
     if repo_id is None:
-        active_project = await get_active_project()
+        active_project = await get_active_project(user_id)
         repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
-
+ 
     aliases = await load_developer_aliases(repo_id)
-
-    timesheets = await db["timesheet_entries"].find({"repo_id": repo_id}).to_list(limit)   # CHANGED — scoped
+ 
+    timesheets = await db["timesheet_entries"].find({"repo_id": repo_id, "user_id": user_id}).to_list(limit)   # CHANGED — scoped per user
     activity_count = await db["activity_logs"].count_documents(
-        {"repo_id": repo_id, "source": {"$in": list(ACTIVITY_SOURCES)}}                     # CHANGED — scoped
+        {"repo_id": repo_id, "user_id": user_id, "source": {"$in": list(ACTIVITY_SOURCES)}}                     # CHANGED — scoped per user
     )
-    cache_key = (id(db), limit, repo_id, _fingerprint_docs(timesheets), activity_count)      # CHANGED — repo_id in key
-
+    cache_key = (id(db), limit, repo_id, user_id, _fingerprint_docs(timesheets), activity_count)      # CHANGED — user_id in key
+ 
     async with _gap_detection_cache_lock:
         if _gap_detection_cache_is_valid() and cache_key in _gap_detection_cache:
             return deepcopy(_gap_detection_cache[cache_key])
-
+ 
     ts_lookup = {
         (
             resolve_developer_id(ts.get("developer_id"), aliases),
@@ -196,26 +212,27 @@ async def run_gap_detection(limit: int = 5000, repo_id: str | None = None) -> di
         ): ts
         for ts in timesheets
     }
-
-    footprints = await build_all_footprints(limit, repo_id=repo_id)   # CHANGED — scoped
-
+ 
+    footprints = await build_all_footprints(limit, repo_id=repo_id, user_id=user_id)   # CHANGED — scoped per user
+ 
     gaps = []
     for footprint in footprints:
         developer_id = footprint["developer_id"]
         date = footprint["date"]
         timesheet = ts_lookup.get((developer_id, date))
         hours_logged = timesheet.get("hours_logged", 0) if timesheet else 0
-
+ 
         if not timesheet:
             reason = "Activity exists but no timesheet"
         elif hours_logged == 0:
             reason = "Timesheet logged 0 hours"
         else:
             continue
-
+ 
         gaps.append(
             {
                 "repo_id": repo_id,   # NEW
+                "user_id": user_id,   # NEW
                 "developer_id": developer_id,
                 "date": date,
                 "reason": reason,
@@ -226,21 +243,21 @@ async def run_gap_detection(limit: int = 5000, repo_id: str | None = None) -> di
                 "hours_logged": hours_logged,
             }
         )
-
+ 
     new_gaps = []
     if gaps:
-        or_filters = [{"repo_id": repo_id, "developer_id": g["developer_id"], "date": g["date"]} for g in gaps]  # CHANGED
+        or_filters = [{"repo_id": repo_id, "user_id": user_id, "developer_id": g["developer_id"], "date": g["date"]} for g in gaps]  # CHANGED
         existing_docs = []
         if or_filters:
             existing_docs = await db["detected_gaps"].find({"$or": or_filters}).to_list(len(or_filters))
-
+ 
         existing_map = {
-            (d.get("repo_id"), d.get("developer_id"), d.get("date")): d for d in existing_docs   # CHANGED — repo_id in key
+            (d.get("repo_id"), d.get("user_id"), d.get("developer_id"), d.get("date")): d for d in existing_docs   # CHANGED — user_id in key
         }
-
+ 
         operations = []
         for gap in gaps:
-            key = (repo_id, gap["developer_id"], gap["date"])   # CHANGED
+            key = (repo_id, user_id, gap["developer_id"], gap["date"])   # CHANGED
             existing = existing_map.get(key)
             status = existing.get("status") if existing else "pending"
             gap_doc = {**gap, "status": status}
@@ -248,98 +265,112 @@ async def run_gap_detection(limit: int = 5000, repo_id: str | None = None) -> di
                 new_gaps.append(gap)
             operations.append(
                 UpdateOne(
-                    {"repo_id": repo_id, "developer_id": gap["developer_id"], "date": gap["date"]},  # CHANGED
+                    {"repo_id": repo_id, "user_id": user_id, "developer_id": gap["developer_id"], "date": gap["date"]},  # CHANGED
                     {"$set": gap_doc},
                     upsert=True,
                 )
             )
-
+ 
         if operations:
             await db["detected_gaps"].bulk_write(operations, ordered=False)
-
+ 
     clean_gaps = [{k: v for k, v in gap.items() if k != "_id"} for gap in gaps]
-
+ 
     result = {
         "repo_id": repo_id,   # NEW
         "total_gaps": len(gaps),
         "new_gaps_saved": len(new_gaps),
         "detected_gaps": clean_gaps,
     }
-
+ 
     async with _gap_detection_cache_lock:
         _gap_detection_cache[cache_key] = deepcopy(result)
         _gap_detection_cache_timestamp = datetime.now(timezone.utc).timestamp()
-
+ 
     return result
-
+ 
+async def _all_active_projects() -> list[dict[str, Any]]:
+    """Background jobs used to operate on one global 'active project'. Now that
+    every user has their own active project, jobs must loop over all of them —
+    one per user — instead of assuming a single global one."""
+    return await db["projects"].find({"is_active": True, "user_id": {"$exists": True}}, {"_id": 0}).to_list(1000)
+ 
+ 
 async def scheduled_gap_detection() -> None:
-    try:
-        await run_gap_detection()
-        timestamp = datetime.now(timezone.utc).isoformat()
-        print(f"Gap detection ran automatically at {timestamp}")
-    except Exception as exc:
-        print(f"Automatic gap detection failed: {exc}")
-
-
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for project in await _all_active_projects():
+        try:
+            await run_gap_detection(project["user_id"], repo_id=project["repo_id"])
+        except Exception as exc:
+            print(f"Automatic gap detection failed for user {project.get('user_id')}: {exc}")
+    print(f"Gap detection ran automatically for all users at {timestamp}")
+ 
+ 
 async def scheduled_data_sync() -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
-
-    active_project = await get_active_project()
-    owner = active_project["owner"] if active_project else settings.github_owner
-    repo = active_project["repo"] if active_project else settings.github_repo
-    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(owner, repo)
-
-    if owner and repo:
-        try:
-            result = await fetch_commits(owner, repo)  # repo_id derived internally from owner/repo
-            print(f"[auto-sync {timestamp}] GitHub: {result}")
-            if active_project:
-                await touch_last_synced(active_project["repo_id"])
-        except Exception as exc:
-            print(f"[auto-sync {timestamp}] GitHub fetch failed: {exc}")
-
-    channel_ids = [c.strip() for c in (settings.slack_channel_ids or "").split(",") if c.strip()]
-    if settings.slack_bot_token and channel_ids:
-        try:
-            from datetime import timedelta
-            end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-            result = await fetch_slack_messages(channel_ids, start, end, repo_id=repo_id)
-            print(f"[auto-sync {timestamp}] Slack: {result}")
-        except Exception as exc:
-            print(f"[auto-sync {timestamp}] Slack fetch failed: {exc}")
-
-    if settings.jira_base_url and settings.jira_project_key:
-        try:
-            from datetime import timedelta
-            end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-            result = await fetch_jira_updates(start, end, settings.jira_project_key, repo_id=repo_id)
-            print(f"[auto-sync {timestamp}] Jira: {result}")
-        except Exception as exc:
-            print(f"[auto-sync {timestamp}] Jira fetch failed: {exc}")
-
+ 
+    for active_project in await _all_active_projects():
+        user_id = active_project["user_id"]
+        owner = active_project["owner"]
+        repo = active_project["repo"]
+        repo_id = active_project["repo_id"]
+ 
+        if owner and repo:
+            try:
+                result = await fetch_commits(owner, repo, user_id=user_id)
+                print(f"[auto-sync {timestamp}] user={user_id} GitHub: {result}")
+                await touch_last_synced(user_id, repo_id)
+            except Exception as exc:
+                print(f"[auto-sync {timestamp}] user={user_id} GitHub fetch failed: {exc}")
+ 
+        channel_ids = [c.strip() for c in (settings.slack_channel_ids or "").split(",") if c.strip()]
+        if settings.slack_bot_token and channel_ids:
+            try:
+                from datetime import timedelta
+                end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+                result = await fetch_slack_messages(channel_ids, start, end, repo_id=repo_id)
+                print(f"[auto-sync {timestamp}] user={user_id} Slack: {result}")
+            except Exception as exc:
+                print(f"[auto-sync {timestamp}] user={user_id} Slack fetch failed: {exc}")
+ 
+        if settings.jira_base_url and settings.jira_project_key:
+            try:
+                from datetime import timedelta
+                end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+                result = await fetch_jira_updates(start, end, settings.jira_project_key, repo_id=repo_id)
+                print(f"[auto-sync {timestamp}] user={user_id} Jira: {result}")
+            except Exception as exc:
+                print(f"[auto-sync {timestamp}] user={user_id} Jira fetch failed: {exc}")
+ 
     invalidate_gap_detection_cache()
-
+ 
 async def write_detected_gaps_snapshot(limit: int = 5000) -> dict[str, Any]:
-    """Compute gap detection and store a ready-to-serve snapshot in the DB.
-
+    """Compute gap detection and store a ready-to-serve snapshot per user in the DB.
+ 
     This allows the API to return a precomputed result quickly instead of
     performing expensive work on-demand.
     """
-    result = await run_gap_detection(limit)
-    snapshot_doc = {
-        "name": "current",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        **result,
-    }
-    await db["detected_gaps_snapshot"].replace_one(
-        {"name": "current"}, snapshot_doc, upsert=True
-    )
-    print("Wrote detected_gaps snapshot to DB")
-    return result
-
-
+    last_result: dict[str, Any] = {}
+    for project in await _all_active_projects():
+        user_id = project["user_id"]
+        result = await run_gap_detection(user_id, limit, repo_id=project["repo_id"])
+        snapshot_doc = {
+            "name": "current",
+            "user_id": user_id,
+            "repo_id": project["repo_id"],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            **result,
+        }
+        await db["detected_gaps_snapshot"].replace_one(
+            {"name": "current", "user_id": user_id, "repo_id": project["repo_id"]}, snapshot_doc, upsert=True
+        )
+        last_result = result
+    print("Wrote detected_gaps snapshots to DB for all users")
+    return last_result
+ 
+ 
 async def _initialize_database_indexes() -> None:
     try:
         await db["activity_logs"].create_index([("repo_id", 1), ("developer_id", 1), ("date", 1)])
@@ -349,10 +380,12 @@ async def _initialize_database_indexes() -> None:
         await db["detected_gaps_snapshot"].create_index([("repo_id", 1), ("name", 1)])
         await db["alerts"].create_index([("repo_id", 1), ("developer_id", 1), ("status", 1)])
         await db["developers"].create_index([("repo_id", 1), ("developer_id", 1)], unique=True)
+        await db["users"].create_index([("email", 1)], unique=True)
+        await db["projects"].create_index([("repo_id", 1), ("user_id", 1)], unique=True)
     except Exception:
         pass
-
-
+ 
+ 
 @app.on_event("startup")
 async def start_gap_detection_scheduler():
     await _initialize_database_indexes()
@@ -403,19 +436,19 @@ async def scheduled_stale_project_cleanup() -> None:
         print(f"[cleanup {datetime.now(timezone.utc).isoformat()}] {result}")
     except Exception as exc:
         print(f"[cleanup] failed: {exc}")
-
-
+ 
+ 
 @app.on_event("shutdown")
 async def stop_gap_detection_scheduler():
     if scheduler.running:
         scheduler.shutdown()
-
-
+ 
+ 
 @app.get("/")
 async def root():
     return {"message": "Unbilled Revenue Detective API is running!"}
-
-
+ 
+ 
 @app.get("/health")
 async def health_check():
     try:
@@ -437,76 +470,80 @@ async def health_check():
                 "error": str(exc),
             },
         }
-
-
-@app.post("/fetch_commits", dependencies=[Depends(verify_api_key)])
+ 
+ 
+@app.post("/fetch_commits")
 async def fetch_commits_endpoint(
     repo_owner: str | None = Query(default=None),
     repo_name: str | None = Query(default=None),
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
-    active_project = await get_active_project()
+    user_id = current_user["user_id"]
+    active_project = await get_active_project(user_id)
     owner = repo_owner or (active_project["owner"] if active_project else settings.github_owner)
     repo = repo_name or (active_project["repo"] if active_project else settings.github_repo)
-
+ 
     if not owner or not repo:
         raise HTTPException(status_code=400, detail="repo_owner and repo_name are required unless a project is registered/active.")
-
-    result = await fetch_commits(owner, repo)
+ 
+    result = await fetch_commits(owner, repo, user_id=user_id)
     if result.get("error"):
         raise HTTPException(status_code=502, detail=result)
-
+ 
     repo_id = result.get("repo_id") or normalize_repo_id(owner, repo)
     stub_result = await generate_timesheet_stubs(repo_id)   # NEW
     result["timesheet_stubs"] = stub_result                 # NEW — visible in the response
-
+ 
     if active_project and owner == active_project["owner"] and repo == active_project["repo"]:
-        await touch_last_synced(active_project["repo_id"])
-
+        await touch_last_synced(user_id, active_project["repo_id"])
+ 
     invalidate_gap_detection_cache()
     return result
-
-@app.post("/projects", dependencies=[Depends(verify_api_key)])
-async def create_project(payload: dict[str, Any] = Body(...)):
+ 
+@app.post("/projects")
+async def create_project(payload: dict[str, Any] = Body(...), current_user: dict = Depends(auth_service.get_current_user)):
     owner = payload.get("owner")
     repo = payload.get("repo")
     if not owner or not repo:
         raise HTTPException(status_code=400, detail="owner and repo are required")
-
+ 
     project = await register_project(
+        user_id=current_user["user_id"],
         owner=owner,
         repo=repo,
         github_token_override=payload.get("github_token_override"),
         make_active=payload.get("make_active", True),
     )
     return {"project": project}
-
-
+ 
+ 
 @app.get("/projects")
-async def get_projects():
-    return {"projects": await list_projects()}
-
-
-@app.post("/projects/{repo_id}/activate", dependencies=[Depends(verify_api_key)])
-async def activate_project(repo_id: str):
-    success = await set_active_project(repo_id)
+async def get_projects(current_user: dict = Depends(auth_service.get_current_user)):
+    return {"projects": await list_projects(current_user["user_id"])}
+ 
+ 
+@app.post("/projects/{repo_id}/activate")
+async def activate_project(repo_id: str, current_user: dict = Depends(auth_service.get_current_user)):
+    success = await set_active_project(current_user["user_id"], repo_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"No project found with repo_id={repo_id}")
     return {"activated": repo_id}
-@app.delete("/projects/{repo_id}", dependencies=[Depends(verify_api_key)])
-async def delete_project(repo_id: str):
-    result = await purge_project_data(repo_id)
+@app.delete("/projects/{repo_id}")
+async def delete_project(repo_id: str, current_user: dict = Depends(auth_service.get_current_user)):
+    result = await purge_project_data(repo_id, user_id=current_user["user_id"])
     return result
-
-
-
+ 
+ 
+ 
 @app.get("/commits")
-async def get_commits(limit: int = Query(default=100, ge=1, le=1000)):
-    commits = await db["activity_logs"].find({"activity_type": "commit"}).to_list(limit)
+async def get_commits(limit: int = Query(default=100, ge=1, le=1000), current_user: dict = Depends(auth_service.get_current_user)):
+    commits = await db["activity_logs"].find({"activity_type": "commit", "user_id": current_user["user_id"]}).to_list(limit)
     return {"commits": [serialize_doc(c) for c in commits]}
-
-@app.post("/developer_aliases", dependencies=[Depends(verify_api_key)])
-async def create_developer_alias(payload: dict[str, Any] = Body(...)):
-    active_project = await get_active_project()
+ 
+@app.post("/developer_aliases")
+async def create_developer_alias(payload: dict[str, Any] = Body(...), current_user: dict = Depends(auth_service.get_current_user)):
+    user_id = current_user["user_id"]
+    active_project = await get_active_project(user_id)
     repo_id = payload.get("repo_id") or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
@@ -515,101 +552,108 @@ async def create_developer_alias(payload: dict[str, Any] = Body(...)):
     canonical_id = payload.get("canonical_id")
     if not alias_id or not canonical_id:
         raise HTTPException(status_code=400, detail="alias_id and canonical_id are required")
-
+ 
     await add_developer_alias(repo_id, alias_id, canonical_id)
     return {"repo_id": repo_id, "alias_id": alias_id.upper(), "canonical_id": canonical_id.upper()}
-
-
+ 
+ 
 @app.get("/developer_aliases")
-async def get_developer_aliases(repo_id: str | None = Query(default=None)):
-    active_project = await get_active_project()
+async def get_developer_aliases(repo_id: str | None = Query(default=None), current_user: dict = Depends(auth_service.get_current_user)):
+    active_project = await get_active_project(current_user["user_id"])
     effective_repo_id = repo_id or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
     return {"repo_id": effective_repo_id, "aliases": await list_developer_aliases(effective_repo_id)}
-
-@app.post("/fetch_slack_messages", dependencies=[Depends(verify_api_key)])
+ 
+@app.post("/fetch_slack_messages")
 async def fetch_slack_messages_endpoint(
     start_date: str | None = Query(default=None),
     end_date: str | None = Query(default=None),
     channel_ids: list[str] = Query(default=[]),
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
     from datetime import timedelta
-
+ 
     effective_start = start_date or (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
     effective_end = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     effective_channels = channel_ids or [
         c.strip() for c in (settings.slack_channel_ids or "").split(",") if c.strip()
     ]
-
+ 
     if not effective_channels:
         raise HTTPException(status_code=400, detail="No channel_ids provided and SLACK_CHANNEL_IDS is not set in .env")
-
-    active_project = await get_active_project()
+ 
+    active_project = await get_active_project(current_user["user_id"])
     repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
-
+ 
     try:
         result = await fetch_slack_messages(effective_channels, effective_start, effective_end, repo_id=repo_id)
         invalidate_gap_detection_cache()
         return result
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
+ 
+ 
 @app.get("/slack_activity")
-async def get_slack_activity(limit: int = Query(default=100, ge=1, le=1000)):
-    messages = await db["activity_logs"].find({"source": "slack"}).to_list(limit)
+async def get_slack_activity(limit: int = Query(default=100, ge=1, le=1000), current_user: dict = Depends(auth_service.get_current_user)):
+    active_project = await get_active_project(current_user["user_id"])
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
+    messages = await db["activity_logs"].find({"source": "slack", "repo_id": repo_id}).to_list(limit)
     return {"slack_activity": [serialize_doc(message) for message in messages]}
-
-
-@app.post("/fetch_jira_updates", dependencies=[Depends(verify_api_key)])
+ 
+ 
+@app.post("/fetch_jira_updates")
 async def fetch_jira_updates_endpoint(
     start_date: str | None = Query(default=None),
     end_date: str | None = Query(default=None),
     project_key: str | None = Query(default=None),
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
     from datetime import timedelta
-
+ 
     effective_start = start_date or (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
     effective_end = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    active_project = await get_active_project()
+ 
+    active_project = await get_active_project(current_user["user_id"])
     repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
-
+ 
     try:
         result = await fetch_jira_updates(effective_start, effective_end, project_key, repo_id=repo_id)
         invalidate_gap_detection_cache()
         return result
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
+ 
+ 
 @app.get("/jira_activity")
-async def get_jira_activity(limit: int = Query(default=100, ge=1, le=1000)):
-    updates = await db["activity_logs"].find({"source": "jira"}).to_list(limit)
+async def get_jira_activity(limit: int = Query(default=100, ge=1, le=1000), current_user: dict = Depends(auth_service.get_current_user)):
+    active_project = await get_active_project(current_user["user_id"])
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
+    updates = await db["activity_logs"].find({"source": "jira", "repo_id": repo_id}).to_list(limit)
     return {"jira_activity": [serialize_doc(update) for update in updates]}
-
+ 
 @app.get("/developers")
 async def get_developers(
     limit: int = Query(default=5000, ge=1, le=5000),
     repo_id: str | None = Query(default=None),   # NEW
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
-    active_project = await get_active_project()
+    active_project = await get_active_project(current_user["user_id"])
     effective_repo_id = repo_id or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
-
+ 
     activity_dev_ids = await db["activity_logs"].distinct("developer_id", {"repo_id": effective_repo_id})  # CHANGED
     activity_dev_ids = {normalize_developer_id(d) for d in activity_dev_ids if d}
-
+ 
     curated_docs = await db["developers"].find({"repo_id": effective_repo_id}).to_list(5000)  # CHANGED
     curated_map = {
         normalize_developer_id(d.get("developer_id", d.get("_id", ""))): d
         for d in curated_docs
     }
-
+ 
     merged = []
     for dev_id in sorted(activity_dev_ids):
         base = {"repo_id": effective_repo_id, "developer_id": dev_id}   # CHANGED — repo_id visible in response
@@ -617,33 +661,36 @@ async def get_developers(
         if extra:
             base.update({k: v for k, v in extra.items() if k not in ("_id", "developer_id", "repo_id")})
         merged.append(base)
-
+ 
     return {"repo_id": effective_repo_id, "developers": merged[:limit]}
-
+ 
 @app.get("/timesheets")
 async def get_timesheets(
     limit: int = Query(default=100, ge=1, le=1000),
     repo_id: str | None = Query(default=None),   # NEW
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
-    active_project = await get_active_project()
+    user_id = current_user["user_id"]
+    active_project = await get_active_project(user_id)
     effective_repo_id = repo_id or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
-    timesheets = await db["timesheet_entries"].find({"repo_id": effective_repo_id}).to_list(limit)  # CHANGED
+    timesheets = await db["timesheet_entries"].find({"repo_id": effective_repo_id, "user_id": user_id}).to_list(limit)  # CHANGED
     return {"timesheets": [serialize_doc(ts) for ts in timesheets]}
-
-@app.post("/timesheets", dependencies=[Depends(verify_api_key)])
-async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Body(...)):
+ 
+@app.post("/timesheets")
+async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Body(...), current_user: dict = Depends(auth_service.get_current_user)):
+    user_id = current_user["user_id"]
     entries = payload if isinstance(payload, list) else [payload]
     inserted = 0
     updated = 0
-
-    active_project = await get_active_project()
+ 
+    active_project = await get_active_project(user_id)
     repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
     aliases = await load_developer_aliases(repo_id)  # NEW
-
-
+ 
+ 
     try:
         for raw_entry in entries:
             if not isinstance(raw_entry, dict):
@@ -653,7 +700,7 @@ async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Bod
                 )
             entry = validate_timesheet_entry(raw_entry)
             existing_activity = await db["activity_logs"].count_documents(
-            {"repo_id": repo_id, "developer_id": entry["developer_id"]}
+            {"repo_id": repo_id, "user_id": user_id, "developer_id": entry["developer_id"]}
             )
             if existing_activity == 0:
                 raise HTTPException(
@@ -661,10 +708,10 @@ async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Bod
                 detail=f"developer_id '{entry['developer_id']}' has no tracked activity in repo_id '{repo_id}'. "
                        f"Timesheets can only be filled for developers with real synced activity.",
                 )
-
+ 
             result = await db["timesheet_entries"].update_one(
-                {"repo_id": repo_id, "developer_id": entry["developer_id"], "date": entry["date"]},
-                {"$set": {**entry, "status": "filled"}},
+                {"repo_id": repo_id, "user_id": user_id, "developer_id": entry["developer_id"], "date": entry["date"]},
+                {"$set": {**entry, "user_id": user_id, "status": "filled"}},
                 upsert=True,   # still upsert=True, but now it's filling a legitimate stub or creating
                                # a valid new row — never a synthetic identity, because we just verified activity exists
             )
@@ -676,10 +723,10 @@ async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Bod
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to upsert timesheets: {exc}") from exc
-
+ 
     invalidate_gap_detection_cache()
     return {"inserted": inserted, "updated": updated, "total": len(entries)}
-
+ 
 @app.put("/timesheets/{developer_id}/{date}")
 async def update_timesheet(
     developer_id: str,
@@ -702,7 +749,7 @@ async def update_timesheet(
             update_fields["hours_logged"] = float(update_fields["hours_logged"])
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="hours_logged must be a number") from exc
-
+ 
     normalized_date = normalize_activity_date(date)
     normalized_developer = normalize_developer_id(developer_id)
     try:
@@ -715,14 +762,14 @@ async def update_timesheet(
             {"$set": update_fields, "$setOnInsert": {"developer_id": normalized_developer, "date": normalized_date}},
             upsert=True,
         )
-
+ 
         # Any successful timesheet submission counts as the gap being addressed —
         # the employee has explicitly accounted for that date, even at 0 hours.
         await db["detected_gaps"].update_one(
             {"developer_id": normalized_developer, "date": normalized_date},
             {"$set": {"status": "resolved"}},
         )
-
+ 
         updated_doc = await db["timesheet_entries"].find_one(
             {"developer_id": normalized_developer, "date": normalized_date}
         )
@@ -731,8 +778,8 @@ async def update_timesheet(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to update timesheet: {exc}") from exc
-
-
+ 
+ 
 @app.delete("/timesheets/{developer_id}/{date}", dependencies=[Depends(verify_api_key)])
 async def delete_timesheet(developer_id: str, date: str):
     normalized_date = normalize_activity_date(date)
@@ -751,131 +798,135 @@ async def delete_timesheet(developer_id: str, date: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to delete timesheet: {exc}") from exc
-
+ 
     return {
         "message": "Timesheet entry deleted",
         "developer_id": developer_id,
         "date": normalized_date,
     }
-
-
+ 
+ 
 @app.get("/detected_gaps")
 async def get_detected_gaps(
     limit: int = Query(default=1000, ge=1, le=5000),
     force: bool = Query(default=False),
     repo_id: str | None = Query(default=None),   # NEW
+    current_user: dict = Depends(auth_service.get_current_user),
 ):
-    active_project = await get_active_project()
+    user_id = current_user["user_id"]
+    active_project = await get_active_project(user_id)
     effective_repo_id = repo_id or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
-
+    snapshot_key = {"name": "current", "repo_id": effective_repo_id, "user_id": user_id}   # CHANGED — user_id in the snapshot key
+ 
     try:
         if force:
-            result = await run_gap_detection(limit, repo_id=effective_repo_id)
+            result = await run_gap_detection(user_id, limit, repo_id=effective_repo_id)
             await db["detected_gaps_snapshot"].replace_one(
-                {"name": "current", "repo_id": effective_repo_id},   # CHANGED — repo_id in the snapshot key
-                {"name": "current", "repo_id": effective_repo_id, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
+                snapshot_key,
+                {**snapshot_key, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
                 upsert=True,
             )
             return result
-
-        snapshot = await db["detected_gaps_snapshot"].find_one({"name": "current", "repo_id": effective_repo_id})  # CHANGED
+ 
+        snapshot = await db["detected_gaps_snapshot"].find_one(snapshot_key)
         if snapshot:
             return {k: v for k, v in snapshot.items() if k not in ("_id", "name", "generated_at")}
-
-        result = await run_gap_detection(limit, repo_id=effective_repo_id)
+ 
+        result = await run_gap_detection(user_id, limit, repo_id=effective_repo_id)
         await db["detected_gaps_snapshot"].replace_one(
-            {"name": "current", "repo_id": effective_repo_id},
-            {"name": "current", "repo_id": effective_repo_id, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
+            snapshot_key,
+            {**snapshot_key, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
             upsert=True,
         )
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to detect gaps: {exc}") from exc
-
+ 
 @app.get("/summarize_gaps")
-async def summarize_gaps(repo_id: str | None = Query(default=None)):   # NEW param
-    active_project = await get_active_project()
+async def summarize_gaps(repo_id: str | None = Query(default=None), current_user: dict = Depends(auth_service.get_current_user)):   # NEW param
+    user_id = current_user["user_id"]
+    active_project = await get_active_project(user_id)
     effective_repo_id = repo_id or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
-
-    gaps = await db["detected_gaps"].find({"repo_id": effective_repo_id, "status": "pending"}).to_list(100)  # CHANGED
-
+ 
+    gaps = await db["detected_gaps"].find({"repo_id": effective_repo_id, "user_id": user_id, "status": "pending"}).to_list(100)  # CHANGED
+ 
     if not gaps:
         return {"message": "No pending gaps found."}
-
+ 
     footprint_lookup: dict[tuple[str, str], dict[str, Any]] = {}
-    footprint_docs = await build_all_footprints(limit=max(100, len(gaps) * 5), repo_id=effective_repo_id)   # CHANGED
+    footprint_docs = await build_all_footprints(limit=max(100, len(gaps) * 5), repo_id=effective_repo_id, user_id=user_id)   # CHANGED
     for footprint in footprint_docs:
         footprint_lookup[(footprint["developer_id"], footprint["date"])] = footprint
-
+ 
     updated = []
     for gap in gaps:
         developer_id = normalize_developer_id(gap.get("developer_id", "UNKNOWN"))
         date = normalize_activity_date(gap.get("date"))
         footprint = footprint_lookup.get((developer_id, date), {})
         enriched_gap = {**gap, "developer_id": developer_id, "date": date, **footprint}
-
+ 
         from starlette.concurrency import run_in_threadpool
         summary = await run_in_threadpool(generate_ai_summary, enriched_gap)
-
+ 
         await db["detected_gaps"].update_one({"_id": gap["_id"]}, {"$set": {"ai_summary": summary}})
         updated.append({**enriched_gap, "ai_summary": summary})
-
+ 
     return {"updated_count": len(updated), "gaps": updated}
-
+ 
 @app.post("/classify_gap")
 async def classify_gap(payload: dict[str, Any] = Body(...)):
     try:
         classification = generate_gap_priority(payload)
-
+ 
         developer_id = normalize_developer_id(payload.get("developer_id", ""))
         date = normalize_activity_date(payload.get("date", ""))
-
+ 
         # Extract just the label (High/Medium/Low) to store as a clean, filterable field
         priority_label = classification.split(" priority", 1)[0].strip().lower() if "priority" in classification.lower() else classification.lower()
-
+ 
         if developer_id and date:
             await db["detected_gaps"].update_one(
                 {"developer_id": developer_id, "date": date},
                 {"$set": {"priority": priority_label, "priority_explanation": classification}},
             )
-
+ 
         return {"classification": classification}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to classify gap: {exc}") from exc
-
-
+ 
+ 
 @app.post("/suggest_timesheet")
 async def suggest_timesheet(payload: dict[str, Any] = Body(...)):
     try:
         return {"suggested_timesheet": suggest_timesheet_entry(payload)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to suggest timesheet: {exc}") from exc
-
-
+ 
+ 
 @app.post("/match_activity")
 async def match_activity(payload: dict[str, Any] = Body(...)):
     try:
         developer_id = normalize_developer_id(payload.get("developer_id", ""))
         date = normalize_activity_date(payload.get("date", ""))
-
+ 
         # Pull the real activity records for this developer/date so the AI
         # has actual commit messages / project labels to reason about,
         # instead of just counts.
         records = await db["activity_logs"].find(
             {"developer_id": developer_id, "date": date}
         ).to_list(200)
-
+ 
         commit_messages = [r.get("message") for r in records if r.get("source") == "github" and r.get("message")]
         slack_messages = [r.get("message") for r in records if r.get("source") == "slack" and r.get("message")]
         jira_issues = [r.get("message") for r in records if r.get("source") == "jira" and r.get("message")]
         current_projects = list({r.get("project") for r in records if r.get("project")})
-
+ 
         enriched_activity = {
             **payload,
             "commit_messages": commit_messages or "None",
@@ -883,12 +934,12 @@ async def match_activity(payload: dict[str, Any] = Body(...)):
             "jira_issues": jira_issues or "None",
             "current_projects": current_projects or "None",
         }
-
+ 
         return {"match": match_activity_to_project(enriched_activity)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to match activity: {exc}") from exc
-
-
+ 
+ 
 @app.post("/ask")
 async def ask_question(payload: dict[str, Any] = Body(...)):
     question = payload.get("question")
@@ -908,19 +959,21 @@ async def ask_question(payload: dict[str, Any] = Body(...)):
         return {"answer": answer_gap_question(details, question)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to answer question: {exc}") from exc
-
-
+ 
+ 
 @app.get("/check_gaps")
 async def check_gaps(limit: int = Query(default=100, ge=1, le=1000)):
     gaps = await db["detected_gaps"].find().to_list(limit)
     return {"gaps": [serialize_doc(g) for g in gaps]}
-
-
-@app.post("/refresh_gaps", dependencies=[Depends(verify_api_key)])
-async def refresh_gaps():
-    """Re-run gap detection and compare new detected gaps against the existing collection."""
+ 
+ 
+@app.post("/refresh_gaps")
+async def refresh_gaps(current_user: dict = Depends(auth_service.get_current_user)):
+    """Re-run gap detection and compare new detected gaps against the existing collection.
+    Fully scoped to the logged-in user — never reads or deletes another user's gaps."""
+    user_id = current_user["user_id"]
     try:
-        existing_gap_docs = await db["detected_gaps"].find({}).to_list(5000)
+        existing_gap_docs = await db["detected_gaps"].find({"user_id": user_id}).to_list(5000)
         existing_keys = {
             (
                 normalize_developer_id(doc.get("developer_id")),
@@ -929,10 +982,10 @@ async def refresh_gaps():
             for doc in existing_gap_docs
             if doc.get("developer_id") is not None and doc.get("date") is not None
         }
-
+ 
         invalidate_gap_detection_cache()
-        detection_result = await run_gap_detection()
-
+        detection_result = await run_gap_detection(user_id)
+ 
         detected_gaps = detection_result.get("detected_gaps", []) or []
         new_keys = {
             (
@@ -943,18 +996,20 @@ async def refresh_gaps():
             if gap.get("developer_id") is not None and gap.get("date") is not None
         }
         new_count = len(new_keys - existing_keys)
-
-        # delete gaps that are no longer active
+ 
+        # delete this user's gaps that are no longer active (never touches other users' rows)
         await db["detected_gaps"].delete_many({
+            "user_id": user_id,
             "$nor": [{"developer_id": k[0], "date": k[1]} for k in new_keys]
-        } if new_keys else {})
-
+        } if new_keys else {"user_id": user_id})
+ 
         total_count = len(detected_gaps)
-
+ 
         await db["detected_gaps_snapshot"].replace_one(
-            {"name": "current"},
+            {"name": "current", "user_id": user_id},
             {
                 "name": "current",
+                "user_id": user_id,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 **detection_result,
             },
@@ -973,17 +1028,19 @@ async def refresh_gaps():
             status_code=500,
             detail=f"Failed to refresh gaps: {exc}"
         ) from exc
-
-
-@app.delete("/gaps/clear", dependencies=[Depends(verify_api_key)])
-async def clear_gaps():
-    """Delete all documents from detected_gaps collection."""
+ 
+ 
+@app.delete("/gaps/clear")
+async def clear_gaps(current_user: dict = Depends(auth_service.get_current_user)):
+    """Delete all of the logged-in user's documents from detected_gaps — never another user's."""
+    user_id = current_user["user_id"]
     try:
-        result = await db["detected_gaps"].delete_many({})
+        result = await db["detected_gaps"].delete_many({"user_id": user_id})
         await db["detected_gaps_snapshot"].replace_one(
-            {"name": "current"},
+            {"name": "current", "user_id": user_id},
             {
                 "name": "current",
+                "user_id": user_id,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "total_gaps": 0,
                 "new_gaps_saved": 0,
@@ -1000,24 +1057,24 @@ async def clear_gaps():
             status_code=500,
             detail=f"Failed to clear gaps: {exc}"
         ) from exc
-
-
+ 
+ 
 @app.post("/import_timesheets", dependencies=[Depends(verify_api_key)])
 async def import_timesheets_csv(file: UploadFile = File(...)):
     """Accept a CSV upload and upsert timesheet entries into MongoDB."""
     import csv
     import io
-
+ 
     inserted = 0
     updated = 0
     skipped = 0
     skip_reasons = []
-
+ 
     try:
         content = await file.read()
         text = content.decode("utf-8")
         reader = csv.DictReader(io.StringIO(text))
-
+ 
         for i, row in enumerate(reader, start=2):
             # Validate required fields
             missing = [
@@ -1030,7 +1087,7 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
                     f"Row {i}: missing fields {missing}"
                 )
                 continue
-
+ 
             # Validate hours_logged
             try:
                 hours = float(row["hours_logged"])
@@ -1042,7 +1099,7 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
                     f"Row {i}: hours_logged must be a number between 0 and 24"
                 )
                 continue
-
+ 
             # Validate date format
             from .activity_utils import normalize_activity_date
             from datetime import datetime
@@ -1055,7 +1112,7 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
                     f"Row {i}: invalid date format '{row['date']}'"
                 )
                 continue
-
+ 
             entry = {
                 "developer_id": normalize_developer_id(row["developer_id"]),
                 "date": normalized_date,
@@ -1063,7 +1120,7 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
                 "project": row.get("project", "").strip() or None,
                 "notes": row.get("notes", "").strip() or None,
             }
-
+ 
             result = await db["timesheet_entries"].update_one(
                 {
                     "developer_id": entry["developer_id"],
@@ -1072,18 +1129,18 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
                 {"$set": entry},
                 upsert=True,
             )
-
+ 
             if result.upserted_id:
                 inserted += 1
             else:
                 updated += 1
-
+ 
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Failed to import CSV: {exc}"
         ) from exc
-
+ 
     invalidate_gap_detection_cache()
     return {
         "inserted": inserted,
@@ -1092,30 +1149,30 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
         "skip_reasons": skip_reasons,
         "total_processed": inserted + updated + skipped,
     }
-
+ 
 # Phase 4: AI Analysis, Alerts, and Triage
-@app.post("/analyze_and_alert", dependencies=[Depends(verify_api_key)])
-async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
+@app.post("/analyze_and_alert")
+async def analyze_and_alert(payload: dict[str, Any] = Body(...), current_user: dict = Depends(auth_service.get_current_user)):
     gap_id = payload.get("gap_id")
     developer_id = payload.get("developer_id")
     date = payload.get("date")
-
+ 
     if not all([gap_id, developer_id, date]):
         raise HTTPException(status_code=400, detail="gap_id, developer_id, and date are required")
-
-    active_project = await get_active_project()
+ 
+    active_project = await get_active_project(current_user["user_id"])
     repo_id = payload.get("repo_id") or (
         active_project["repo_id"] if active_project
         else normalize_repo_id(settings.github_owner, settings.github_repo)
     )
-
+ 
     try:
         priority = generate_gap_priority(payload)
         timesheet_suggestion = suggest_timesheet_entry(payload)
-
+ 
         summary = payload.get("summary", "Gap analysis performed.")
         recommended_action = f"Review suggested timesheet: {timesheet_suggestion.get('hours', 0)}h on {timesheet_suggestion.get('project', 'Unknown')}"
-
+ 
         alert = await generate_alert(
             gap_id=gap_id,
             developer_id=developer_id,
@@ -1125,16 +1182,16 @@ async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
             recommended_action=recommended_action,
             repo_id=repo_id,   # NEW
         )
-
+ 
         slack_sent = await send_slack_notification(alert)
-
+ 
         # CHANGED — auto-resolve recipient from developers collection;
         # payload can still override it explicitly if needed
         email_sent = False
         recipient_email = payload.get("recipient_email") or await resolve_alert_recipient_email(repo_id, developer_id)
         if recipient_email:
             email_sent = await send_email_notification(alert, recipient_email)
-
+ 
         return {
             "alert": alert,
             "priority": priority,
@@ -1145,7 +1202,7 @@ async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
+ 
 @app.get("/alerts/pending")
 async def get_pending_alerts_endpoint(limit: int = Query(default=100, ge=1, le=1000)):
     """Get all pending (unnotified) alerts."""
@@ -1154,8 +1211,8 @@ async def get_pending_alerts_endpoint(limit: int = Query(default=100, ge=1, le=1
         return {"pending_alerts": alerts, "count": len(alerts)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch pending alerts: {exc}") from exc
-
-
+ 
+ 
 @app.get("/alerts/history")
 async def get_alert_history_endpoint(
     developer_id: str | None = Query(default=None),
@@ -1167,8 +1224,8 @@ async def get_alert_history_endpoint(
         return {"alerts": alerts, "count": len(alerts)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to fetch alert history: {exc}") from exc
-
-
+ 
+ 
 @app.post("/alerts/{alert_id}/mark_notified", dependencies=[Depends(verify_api_key)])
 async def mark_alert_notified_endpoint(alert_id: str):
     """Mark an alert as notified."""
@@ -1181,8 +1238,8 @@ async def mark_alert_notified_endpoint(alert_id: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to mark alert: {exc}") from exc
-
-
+ 
+ 
 @app.post("/alerts/{alert_id}/resolve", dependencies=[Depends(verify_api_key)])
 async def resolve_alert_endpoint(
     alert_id: str,

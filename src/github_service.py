@@ -17,7 +17,7 @@ def _github_headers() -> dict[str, str]:
     return headers
 
 
-async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
+async def fetch_commits(repo_owner: str, repo_name: str, user_id: str) -> dict:
     repo_id = normalize_repo_id(repo_owner, repo_name)
     aliases = await load_developer_aliases(repo_id)
     count = 0
@@ -69,10 +69,11 @@ async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
 
                 operations.append(
                     UpdateOne(
-                        {"repo_id": repo_id, "source": "github", "activity_type": "commit", "commit_id": commit_id},
+                        {"repo_id": repo_id, "user_id": user_id, "source": "github", "activity_type": "commit", "commit_id": commit_id},
                         {
                             "$set": {
                                 "repo_id": repo_id,
+                                "user_id": user_id,
                                 "developer_id": developer_id,
                                 "developer_name": developer_name,
                                 "developer_email": developer_email,
@@ -109,9 +110,9 @@ async def fetch_commits(repo_owner: str, repo_name: str) -> dict:
     if developer_contacts:
         contact_ops = [
             UpdateOne(
-                {"repo_id": repo_id, "developer_id": dev_id},
+                {"repo_id": repo_id, "user_id": user_id, "developer_id": dev_id},
                 {
-                    "$set": {"repo_id": repo_id, "developer_id": dev_id, "email": info["email"], "name": info["name"]},
+                    "$set": {"repo_id": repo_id, "user_id": user_id, "developer_id": dev_id, "email": info["email"], "name": info["name"]},
                     "$setOnInsert": {"source": "github_auto"},
                 },
                 upsert=True,

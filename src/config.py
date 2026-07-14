@@ -28,6 +28,12 @@ class Settings:
     jira_api_token: str | None = os.getenv("JIRA_API_TOKEN")
     jira_project_key: str | None = os.getenv("JIRA_PROJECT_KEY")
 
+    # Secret used to sign login tokens. MUST be set to a long random string
+    # in production (.env: JWT_SECRET=...). Falls back to a dev-only default
+    # so local testing doesn't break, but this fallback is NOT safe to deploy.
+    jwt_secret: str = os.getenv("JWT_SECRET", "dev-only-insecure-secret-change-me")
+    jwt_expire_minutes: int = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
+
 
 @lru_cache
 def get_settings() -> Settings:

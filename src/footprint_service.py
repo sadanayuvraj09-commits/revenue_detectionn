@@ -52,23 +52,26 @@ def _footprint_from_activities(developer_id: str, date: str, activities: list[di
     }
 
 
-async def build_developer_footprint(developer_id: str, date: str, repo_id: str = DEFAULT_REPO_ID) -> dict[str, Any]:
+async def build_developer_footprint(developer_id: str, date: str, repo_id: str = DEFAULT_REPO_ID, user_id: str | None = None) -> dict[str, Any]:
     normalized_developer_id = normalize_developer_id(developer_id)
     normalized_date = normalize_activity_date(date)
 
-    activities = await db.activity_logs.find(
-        {"repo_id": repo_id, "developer_id": normalized_developer_id, "date": normalized_date}
-    ).to_list(500)
+    query: dict[str, Any] = {"repo_id": repo_id, "developer_id": normalized_developer_id, "date": normalized_date}
+    if user_id:
+        query["user_id"] = user_id
+
+    activities = await db.activity_logs.find(query).to_list(500)
 
     return _footprint_from_activities(normalized_developer_id, normalized_date, activities)
 
 
 
-async def build_all_footprints(limit: int = 5000, repo_id: str = DEFAULT_REPO_ID) -> list[dict[str, Any]]:
+async def build_all_footprints(limit: int = 5000, repo_id: str = DEFAULT_REPO_ID, user_id: str | None = None) -> list[dict[str, Any]]:
     aliases = await load_developer_aliases(repo_id)   # NEW — one query, not per-activity
-    activities = await db.activity_logs.find(
-        {"repo_id": repo_id, "source": {"$in": list(ACTIVITY_SOURCES)}},
-    ).to_list(limit)
+    query: dict[str, Any] = {"repo_id": repo_id, "source": {"$in": list(ACTIVITY_SOURCES)}}
+    if user_id:
+        query["user_id"] = user_id
+    activities = await db.activity_logs.find(query).to_list(limit)
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for activity in activities:
