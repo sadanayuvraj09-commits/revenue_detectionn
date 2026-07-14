@@ -3,7 +3,7 @@ from datetime import datetime, time, timezone
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.errors import SlackApiError
 
-from .activity_utils import normalize_activity_date, normalize_developer_id
+from .activity_utils import normalize_activity_date, normalize_developer_id, DEFAULT_REPO_ID
 from .config import get_settings
 from .database import db
 
@@ -18,11 +18,7 @@ def _slack_client() -> AsyncWebClient:
 
 
 def _configured_channels() -> list[str]:
-    return [
-        channel.strip()
-        for channel in settings.slack_channel_ids.split(",")
-        if channel.strip()
-    ]
+    return [c.strip() for c in settings.slack_channel_ids.split(",") if c.strip()]
 
 
 def _to_slack_ts(date_text: str, end_of_day: bool = False) -> str:
@@ -34,7 +30,6 @@ def _to_slack_ts(date_text: str, end_of_day: bool = False) -> str:
 async def _resolve_developer_id(slack_user_id: str, cache: dict[str, str]) -> str:
     if slack_user_id in cache:
         return cache[slack_user_id]
-
     developer = await db.developers.find_one(
         {"$or": [{"slack_user_id": slack_user_id}, {"slack_id": slack_user_id}]}
     )
@@ -52,6 +47,7 @@ async def fetch_slack_messages(
     start_date: str | None = None,
     end_date: str | None = None,
     project: str = "slack",
+    repo_id: str = DEFAULT_REPO_ID,   # NEW — caller passes the active project's repo_id
 ) -> dict:
     """Fetch Slack channel messages and upsert them into activity_logs."""
     channels = channel_ids or _configured_channels()
@@ -74,22 +70,16 @@ async def fetch_slack_messages(
         while True:
             try:
                 response = await client.conversations_history(
-                    channel=channel_id,
-                    oldest=oldest,
-                    latest=latest,
-                    limit=200,
-                    inclusive=True,
-                    cursor=cursor,
+                    channel=channel_id, oldest=oldest, latest=latest,
+                    limit=200, inclusive=True, cursor=cursor,
                 )
             except SlackApiError as exc:
-                error = exc.response.get("error", "Slack API request failed.")
-                raise RuntimeError(error) from exc
+                raise RuntimeError(exc.response.get("error", "Slack API request failed.")) from exc
 
             messages = response.get("messages", [])
             total_fetched += len(messages)
 
             for message in messages:
-                # Skip bot-authored messages entirely — they aren't real developer activity
                 if message.get("bot_id") or message.get("subtype") == "bot_message":
                     continue
 
@@ -105,6 +95,7 @@ async def fetch_slack_messages(
 
                 result = await db.activity_logs.update_one(
                     {
+                        "repo_id": repo_id,
                         "source": "slack",
                         "activity_type": "message",
                         "channel_id": channel_id,
@@ -112,6 +103,7 @@ async def fetch_slack_messages(
                     },
                     {
                         "$set": {
+                            "repo_id": repo_id,
                             "developer_id": developer_id,
                             "source": "slack",
                             "activity_type": "message",
@@ -136,10 +128,8 @@ async def fetch_slack_messages(
                 break
 
     return {
-        "source": "slack",
-        "fetched": total_fetched,
-        "saved": total_saved,
-        "channels": channels,
+        "source": "slack", "fetched": total_fetched, "saved": total_saved,
+        "channels": channels, "repo_id": repo_id,
         "start_date": normalize_activity_date(start_date),
         "end_date": normalize_activity_date(latest_date),
     }

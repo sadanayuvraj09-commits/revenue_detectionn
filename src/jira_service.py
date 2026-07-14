@@ -3,7 +3,7 @@ from typing import Any
 
 import httpx
 
-from .activity_utils import normalize_activity_date, normalize_developer_id
+from .activity_utils import normalize_activity_date, normalize_developer_id, DEFAULT_REPO_ID
 from .config import get_settings
 from .database import db
 
@@ -26,12 +26,7 @@ def _jira_base_url() -> str:
 def _updated_jql(start_date: str, end_date: str | None, project_key: str | None) -> str:
     start = normalize_activity_date(start_date)
     end = normalize_activity_date(end_date or start_date)
-    next_day = (
-        datetime.fromisoformat(end)
-        .replace(tzinfo=timezone.utc)
-        + timedelta(days=1)
-    ).date().isoformat()
-
+    next_day = (datetime.fromisoformat(end).replace(tzinfo=timezone.utc) + timedelta(days=1)).date().isoformat()
     clauses = [f'updated >= "{start}"', f'updated < "{next_day}"']
     if project_key:
         clauses.insert(0, f'project = "{project_key}"')
@@ -57,6 +52,7 @@ async def fetch_jira_updates(
     end_date: str | None = None,
     project_key: str | None = None,
     max_results: int = 100,
+    repo_id: str = DEFAULT_REPO_ID,   # NEW
 ) -> dict:
     """Fetch Jira issue updates and upsert them into activity_logs."""
     project = project_key or settings.jira_project_key
@@ -70,22 +66,18 @@ async def fetch_jira_updates(
     async with httpx.AsyncClient(auth=_jira_auth(), timeout=30) as http_client:
         while True:
             params = {
-                "jql": jql,
-                "maxResults": max_results,
+                "jql": jql, "maxResults": max_results,
                 "fields": "summary,status,assignee,updated,created,project",
             }
             if next_page_token:
                 params["nextPageToken"] = next_page_token
 
             response = await http_client.get(
-                f"{base_url}/rest/api/3/search/jql",
-                params=params,
+                f"{base_url}/rest/api/3/search/jql", params=params,
                 headers={"Accept": "application/json"},
             )
             if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Jira API returned {response.status_code}: {response.text}"
-                )
+                raise RuntimeError(f"Jira API returned {response.status_code}: {response.text}")
 
             payload = response.json()
             issues = payload.get("issues", [])
@@ -106,6 +98,7 @@ async def fetch_jira_updates(
 
                 result = await db.activity_logs.update_one(
                     {
+                        "repo_id": repo_id,
                         "source": "jira",
                         "activity_type": "issue_update",
                         "issue_key": issue_key,
@@ -113,6 +106,7 @@ async def fetch_jira_updates(
                     },
                     {
                         "$set": {
+                            "repo_id": repo_id,
                             "developer_id": developer_id,
                             "source": "jira",
                             "activity_type": "issue_update",
@@ -138,10 +132,8 @@ async def fetch_jira_updates(
                 break
 
     return {
-        "source": "jira",
-        "fetched": total_fetched,
-        "saved": total_saved,
-        "project_key": project,
+        "source": "jira", "fetched": total_fetched, "saved": total_saved,
+        "project_key": project, "repo_id": repo_id,
         "start_date": normalize_activity_date(start_date),
         "end_date": normalize_activity_date(end_date or start_date),
     }

@@ -29,26 +29,14 @@ async def generate_alert(
     priority: str,
     summary: str,
     recommended_action: str,
+    repo_id: str,   # NEW — required so alerts are scoped and recipient lookup works
 ) -> dict[str, Any]:
-    """
-    Generate and store an alert from a gap analysis.
-    
-    Args:
-        gap_id: MongoDB ObjectId of the detected gap
-        developer_id: Developer ID
-        date: Gap date
-        priority: Priority level (high/medium/low)
-        summary: AI summary of the gap
-        recommended_action: Recommended action from AI
-        
-    Returns:
-        Alert document as dict
-    """
     severity = AlertSeverity.HIGH if priority.lower() == "high" else (
         AlertSeverity.MEDIUM if priority.lower() == "medium" else AlertSeverity.LOW
     )
-    
+
     alert = {
+        "repo_id": repo_id,   # NEW
         "gap_id": gap_id,
         "developer_id": developer_id,
         "date": date,
@@ -61,24 +49,33 @@ async def generate_alert(
         "notified_at": None,
         "resolved_at": None,
     }
-    
+
     result = await db["alerts"].insert_one(alert)
     alert["_id"] = str(result.inserted_id)
     return alert
 
 
-async def get_pending_alerts(limit: int = 100) -> list[dict[str, Any]]:
-    """Get all pending (unnotified) alerts."""
-    alerts = await db["alerts"].find({"status": "pending"}).to_list(limit)
-    return [{"_id": str(a.get("_id")), **{k: v for k, v in a.items() if k != "_id"}} for a in alerts]
+async def resolve_alert_recipient_email(repo_id: str, developer_id: str) -> str | None:
+    """NEW — looks up the developer's email instead of requiring it in the request payload."""
+    developer = await db["developers"].find_one({"repo_id": repo_id, "developer_id": developer_id})
+    return developer.get("email") if developer else None
 
-
-async def get_alert_history(developer_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-    """Get alert history, optionally filtered by developer."""
-    query = {} if developer_id is None else {"developer_id": developer_id}
+async def get_pending_alerts(limit: int = 100, repo_id: str | None = None) -> list[dict[str, Any]]:
+    query = {"status": "pending"}
+    if repo_id:
+        query["repo_id"] = repo_id
     alerts = await db["alerts"].find(query).to_list(limit)
     return [{"_id": str(a.get("_id")), **{k: v for k, v in a.items() if k != "_id"}} for a in alerts]
 
+
+async def get_alert_history(developer_id: str | None = None, repo_id: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    query = {}
+    if developer_id is not None:
+        query["developer_id"] = developer_id
+    if repo_id:
+        query["repo_id"] = repo_id
+    alerts = await db["alerts"].find(query).to_list(limit)
+    return [{"_id": str(a.get("_id")), **{k: v for k, v in a.items() if k != "_id"}} for a in alerts]
 
 async def mark_alert_notified(alert_id: str) -> bool:
     """Mark an alert as notified."""

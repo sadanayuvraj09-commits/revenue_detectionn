@@ -9,15 +9,14 @@ def normalize_developer_id(value: Any) -> str:
     return normalized or "UNKNOWN"
 
 
-DEVELOPER_ALIASES = {
-    "YUVRAJ": "YUVRAJ SADANA",
-    "YUVRAJ SADANA": "YUVRAJ SADANA",
-}
-
-
-def resolve_developer_id(value: Any) -> str:
+def resolve_developer_id(value: Any, aliases: dict[str, str] | None = None) -> str:
+    """Normalize, then apply a repo-scoped alias map if one is provided.
+    `aliases` should come from alias_service.load_developer_aliases(repo_id),
+    loaded once per operation — not per row — to avoid N+1 queries."""
     normalized = normalize_developer_id(value)
-    return DEVELOPER_ALIASES.get(normalized, normalized)
+    if aliases:
+        return aliases.get(normalized, normalized)
+    return normalized
 
 
 def normalize_activity_date(value: Any) -> str:
@@ -42,3 +41,17 @@ def normalize_activity_date(value: Any) -> str:
         return text[:10]
 
     return text
+
+DEFAULT_REPO_ID = "UNSCOPED"
+
+def normalize_repo_id(owner, repo=None) -> str:
+    """
+    Canonical repo_id used to scope every collection.
+    normalize_repo_id("MyOrg", "MyRepo") -> "myorg/myrepo"
+    normalize_repo_id("MyOrg/MyRepo")    -> "myorg/myrepo"
+    """
+    if owner is None:
+        return DEFAULT_REPO_ID
+    combined = str(owner).strip() if repo is None else f"{str(owner).strip()}/{str(repo).strip()}"
+    combined = combined.strip("/").lower()
+    return combined or DEFAULT_REPO_ID

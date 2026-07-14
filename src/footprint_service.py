@@ -1,11 +1,18 @@
 from collections import Counter, defaultdict
 from typing import Any
 
-from .activity_utils import normalize_activity_date, normalize_developer_id, resolve_developer_id
+from .activity_utils import normalize_activity_date, normalize_developer_id, normalize_repo_id, resolve_developer_id
+from .alias_service import load_developer_aliases
+from .config import get_settings
 from .database import db
 
 
 ACTIVITY_SOURCES = ("github", "slack", "jira")
+
+
+
+_settings = get_settings()
+DEFAULT_REPO_ID = normalize_repo_id(_settings.github_owner, _settings.github_repo)
 
 
 def _activity_sample(activity: dict[str, Any]) -> dict[str, Any]:
@@ -45,29 +52,27 @@ def _footprint_from_activities(developer_id: str, date: str, activities: list[di
     }
 
 
-async def build_developer_footprint(developer_id: str, date: str) -> dict[str, Any]:
-    """Single-developer/day lookup — still does one targeted query, which is fine for one-off calls
-    (e.g. from /ask or /classify_gap), since it's just a single day of one person's activity."""
+async def build_developer_footprint(developer_id: str, date: str, repo_id: str = DEFAULT_REPO_ID) -> dict[str, Any]:
     normalized_developer_id = normalize_developer_id(developer_id)
     normalized_date = normalize_activity_date(date)
 
     activities = await db.activity_logs.find(
-        {"developer_id": normalized_developer_id, "date": normalized_date}
+        {"repo_id": repo_id, "developer_id": normalized_developer_id, "date": normalized_date}
     ).to_list(500)
 
     return _footprint_from_activities(normalized_developer_id, normalized_date, activities)
 
 
-async def build_all_footprints(limit: int = 5000) -> list[dict[str, Any]]:
-    """Builds footprints for every developer/day pair with exactly ONE database query total,
-    instead of one query per pair (which was the N+1 bottleneck)."""
+
+async def build_all_footprints(limit: int = 5000, repo_id: str = DEFAULT_REPO_ID) -> list[dict[str, Any]]:
+    aliases = await load_developer_aliases(repo_id)   # NEW — one query, not per-activity
     activities = await db.activity_logs.find(
-        {"source": {"$in": list(ACTIVITY_SOURCES)}},
+        {"repo_id": repo_id, "source": {"$in": list(ACTIVITY_SOURCES)}},
     ).to_list(limit)
 
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for activity in activities:
-        developer_id = resolve_developer_id(activity.get("developer_id"))
+        developer_id = resolve_developer_id(activity.get("developer_id"), aliases)  # CHANGED
         date = normalize_activity_date(activity.get("date") or activity.get("timestamp"))
         if date == "UNKNOWN":
             continue

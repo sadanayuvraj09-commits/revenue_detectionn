@@ -6,6 +6,20 @@ from datetime import datetime, timezone
 from typing import Any
 from pymongo import UpdateOne
 
+from .alert_service import (
+    generate_alert,
+    send_slack_notification,
+    send_email_notification,
+    resolve_alert_recipient_email,   # NEW
+)
+
+from .timesheet_stub_service import generate_timesheet_stubs
+from .alias_service import load_developer_aliases, add_developer_alias, list_developer_aliases
+from .project_service import get_active_project  # already added in Step 2
+from .cleanup_service import purge_project_data, cleanup_stale_projects
+
+from .activity_utils import normalize_repo_id
+
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 except ImportError:  # pragma: no cover - fallback for minimal environments
@@ -45,6 +59,13 @@ from .config import get_settings
 from .database import db
 from .footprint_service import ACTIVITY_SOURCES, build_all_footprints, build_developer_footprint
 from .github_service import fetch_commits
+from .project_service import (
+    get_active_project,
+    list_projects,
+    register_project,
+    set_active_project,
+    touch_last_synced,
+)
 from .jira_service import fetch_jira_updates
 from .slack_service import fetch_slack_messages
 
@@ -122,7 +143,7 @@ async def get_activity_count(developer_id: str, date: str, source: str) -> int:
     return footprint.get(f"{source}_count", 0)
 
 
-def validate_timesheet_entry(entry: dict[str, Any]) -> dict[str, Any]:
+def validate_timesheet_entry(entry: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
     required_fields = ["developer_id", "date", "hours_logged"]
     for field in required_fields:
         if field not in entry or entry.get(field) in (None, ""):
@@ -142,25 +163,27 @@ def validate_timesheet_entry(entry: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="hours_logged must be a number") from exc
 
     return {
-        "developer_id": resolve_developer_id(entry["developer_id"]),
+        "developer_id": resolve_developer_id(entry["developer_id"], aliases),  # CHANGED
         "date": normalized_date,
         "hours_logged": hours_logged,
         "project": entry.get("project"),
         "notes": entry.get("notes"),
     }
 
-
-async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
+async def run_gap_detection(limit: int = 5000, repo_id: str | None = None) -> dict[str, Any]:
     global _gap_detection_cache_timestamp
 
-    timesheets = await db["timesheet_entries"].find().to_list(limit)
-    activity_count = await db["activity_logs"].count_documents({"source": {"$in": list(ACTIVITY_SOURCES)}})
-    cache_key = (
-        id(db),
-        limit,
-        _fingerprint_docs(timesheets),
-        activity_count,
+    if repo_id is None:
+        active_project = await get_active_project()
+        repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
+
+    aliases = await load_developer_aliases(repo_id)
+
+    timesheets = await db["timesheet_entries"].find({"repo_id": repo_id}).to_list(limit)   # CHANGED — scoped
+    activity_count = await db["activity_logs"].count_documents(
+        {"repo_id": repo_id, "source": {"$in": list(ACTIVITY_SOURCES)}}                     # CHANGED — scoped
     )
+    cache_key = (id(db), limit, repo_id, _fingerprint_docs(timesheets), activity_count)      # CHANGED — repo_id in key
 
     async with _gap_detection_cache_lock:
         if _gap_detection_cache_is_valid() and cache_key in _gap_detection_cache:
@@ -168,13 +191,13 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
 
     ts_lookup = {
         (
-            resolve_developer_id(ts.get("developer_id")),
+            resolve_developer_id(ts.get("developer_id"), aliases),
             normalize_activity_date(ts.get("date")),
         ): ts
         for ts in timesheets
     }
 
-    footprints = await build_all_footprints(limit)
+    footprints = await build_all_footprints(limit, repo_id=repo_id)   # CHANGED — scoped
 
     gaps = []
     for footprint in footprints:
@@ -192,6 +215,7 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
 
         gaps.append(
             {
+                "repo_id": repo_id,   # NEW
                 "developer_id": developer_id,
                 "date": date,
                 "reason": reason,
@@ -203,22 +227,20 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
             }
         )
 
-    # Use a single bulk_write to upsert all gaps to avoid N round-trips.
     new_gaps = []
     if gaps:
-        # Fetch existing docs for these developer/date pairs in one query
-        or_filters = [{"developer_id": g["developer_id"], "date": g["date"]} for g in gaps]
+        or_filters = [{"repo_id": repo_id, "developer_id": g["developer_id"], "date": g["date"]} for g in gaps]  # CHANGED
         existing_docs = []
         if or_filters:
             existing_docs = await db["detected_gaps"].find({"$or": or_filters}).to_list(len(or_filters))
 
         existing_map = {
-            (d.get("developer_id"), d.get("date")): d for d in existing_docs
+            (d.get("repo_id"), d.get("developer_id"), d.get("date")): d for d in existing_docs   # CHANGED — repo_id in key
         }
 
         operations = []
         for gap in gaps:
-            key = (gap["developer_id"], gap["date"])
+            key = (repo_id, gap["developer_id"], gap["date"])   # CHANGED
             existing = existing_map.get(key)
             status = existing.get("status") if existing else "pending"
             gap_doc = {**gap, "status": status}
@@ -226,7 +248,7 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
                 new_gaps.append(gap)
             operations.append(
                 UpdateOne(
-                    {"developer_id": gap["developer_id"], "date": gap["date"]},
+                    {"repo_id": repo_id, "developer_id": gap["developer_id"], "date": gap["date"]},  # CHANGED
                     {"$set": gap_doc},
                     upsert=True,
                 )
@@ -235,11 +257,10 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
         if operations:
             await db["detected_gaps"].bulk_write(operations, ordered=False)
 
-    # Strip any MongoDB _id fields that insert_many may have attached in-place,
-    # since ObjectId isn't JSON-serializable.
     clean_gaps = [{k: v for k, v in gap.items() if k != "_id"} for gap in gaps]
 
     result = {
+        "repo_id": repo_id,   # NEW
         "total_gaps": len(gaps),
         "new_gaps_saved": len(new_gaps),
         "detected_gaps": clean_gaps,
@@ -251,7 +272,6 @@ async def run_gap_detection(limit: int = 5000) -> dict[str, Any]:
 
     return result
 
-
 async def scheduled_gap_detection() -> None:
     try:
         await run_gap_detection()
@@ -260,15 +280,21 @@ async def scheduled_gap_detection() -> None:
     except Exception as exc:
         print(f"Automatic gap detection failed: {exc}")
 
+
 async def scheduled_data_sync() -> None:
-    """Automatically pull fresh GitHub/Slack/Jira activity on a timer,
-    so new developer activity shows up without anyone clicking Fetch."""
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    if settings.github_owner and settings.github_repo:
+    active_project = await get_active_project()
+    owner = active_project["owner"] if active_project else settings.github_owner
+    repo = active_project["repo"] if active_project else settings.github_repo
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(owner, repo)
+
+    if owner and repo:
         try:
-            result = await fetch_commits(settings.github_owner, settings.github_repo)
+            result = await fetch_commits(owner, repo)  # repo_id derived internally from owner/repo
             print(f"[auto-sync {timestamp}] GitHub: {result}")
+            if active_project:
+                await touch_last_synced(active_project["repo_id"])
         except Exception as exc:
             print(f"[auto-sync {timestamp}] GitHub fetch failed: {exc}")
 
@@ -278,7 +304,7 @@ async def scheduled_data_sync() -> None:
             from datetime import timedelta
             end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-            result = await fetch_slack_messages(channel_ids, start, end)
+            result = await fetch_slack_messages(channel_ids, start, end, repo_id=repo_id)
             print(f"[auto-sync {timestamp}] Slack: {result}")
         except Exception as exc:
             print(f"[auto-sync {timestamp}] Slack fetch failed: {exc}")
@@ -288,13 +314,12 @@ async def scheduled_data_sync() -> None:
             from datetime import timedelta
             end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             start = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-            result = await fetch_jira_updates(start, end, settings.jira_project_key)
+            result = await fetch_jira_updates(start, end, settings.jira_project_key, repo_id=repo_id)
             print(f"[auto-sync {timestamp}] Jira: {result}")
         except Exception as exc:
             print(f"[auto-sync {timestamp}] Jira fetch failed: {exc}")
 
     invalidate_gap_detection_cache()
-
 
 async def write_detected_gaps_snapshot(limit: int = 5000) -> dict[str, Any]:
     """Compute gap detection and store a ready-to-serve snapshot in the DB.
@@ -317,10 +342,13 @@ async def write_detected_gaps_snapshot(limit: int = 5000) -> dict[str, Any]:
 
 async def _initialize_database_indexes() -> None:
     try:
-        await db["activity_logs"].create_index([("developer_id", 1), ("date", 1)])
-        await db["activity_logs"].create_index([("source", 1), ("activity_type", 1)])
-        await db["timesheet_entries"].create_index([("developer_id", 1), ("date", 1)])
-        await db["detected_gaps"].create_index([("developer_id", 1), ("date", 1)])
+        await db["activity_logs"].create_index([("repo_id", 1), ("developer_id", 1), ("date", 1)])
+        await db["activity_logs"].create_index([("repo_id", 1), ("source", 1), ("activity_type", 1)])
+        await db["timesheet_entries"].create_index([("repo_id", 1), ("developer_id", 1), ("date", 1)])
+        await db["detected_gaps"].create_index([("repo_id", 1), ("developer_id", 1), ("date", 1)])
+        await db["detected_gaps_snapshot"].create_index([("repo_id", 1), ("name", 1)])
+        await db["alerts"].create_index([("repo_id", 1), ("developer_id", 1), ("status", 1)])
+        await db["developers"].create_index([("repo_id", 1), ("developer_id", 1)], unique=True)
     except Exception:
         pass
 
@@ -355,12 +383,26 @@ async def start_gap_detection_scheduler():
             id="detected_gaps_snapshot",
             replace_existing=True,
         )
+        scheduler.add_job(
+            scheduled_stale_project_cleanup,
+            "interval",
+            hours=24,
+            id="stale_project_cleanup",
+            replace_existing=True,
+        )
         # Prime the snapshot immediately on startup
+        
         try:
             await write_detected_gaps_snapshot()
         except Exception:
             pass
         scheduler.start()
+async def scheduled_stale_project_cleanup() -> None:
+    try:
+        result = await cleanup_stale_projects(stale_after_days=30)
+        print(f"[cleanup {datetime.now(timezone.utc).isoformat()}] {result}")
+    except Exception as exc:
+        print(f"[cleanup] failed: {exc}")
 
 
 @app.on_event("shutdown")
@@ -402,19 +444,59 @@ async def fetch_commits_endpoint(
     repo_owner: str | None = Query(default=None),
     repo_name: str | None = Query(default=None),
 ):
-    owner = repo_owner or settings.github_owner
-    repo = repo_name or settings.github_repo
+    active_project = await get_active_project()
+    owner = repo_owner or (active_project["owner"] if active_project else settings.github_owner)
+    repo = repo_name or (active_project["repo"] if active_project else settings.github_repo)
+
     if not owner or not repo:
-        raise HTTPException(
-            status_code=400,
-            detail="repo_owner and repo_name are required unless GITHUB_OWNER and GITHUB_REPO are set.",
-        )
+        raise HTTPException(status_code=400, detail="repo_owner and repo_name are required unless a project is registered/active.")
 
     result = await fetch_commits(owner, repo)
     if result.get("error"):
         raise HTTPException(status_code=502, detail=result)
+
+    repo_id = result.get("repo_id") or normalize_repo_id(owner, repo)
+    stub_result = await generate_timesheet_stubs(repo_id)   # NEW
+    result["timesheet_stubs"] = stub_result                 # NEW — visible in the response
+
+    if active_project and owner == active_project["owner"] and repo == active_project["repo"]:
+        await touch_last_synced(active_project["repo_id"])
+
     invalidate_gap_detection_cache()
     return result
+
+@app.post("/projects", dependencies=[Depends(verify_api_key)])
+async def create_project(payload: dict[str, Any] = Body(...)):
+    owner = payload.get("owner")
+    repo = payload.get("repo")
+    if not owner or not repo:
+        raise HTTPException(status_code=400, detail="owner and repo are required")
+
+    project = await register_project(
+        owner=owner,
+        repo=repo,
+        github_token_override=payload.get("github_token_override"),
+        make_active=payload.get("make_active", True),
+    )
+    return {"project": project}
+
+
+@app.get("/projects")
+async def get_projects():
+    return {"projects": await list_projects()}
+
+
+@app.post("/projects/{repo_id}/activate", dependencies=[Depends(verify_api_key)])
+async def activate_project(repo_id: str):
+    success = await set_active_project(repo_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"No project found with repo_id={repo_id}")
+    return {"activated": repo_id}
+@app.delete("/projects/{repo_id}", dependencies=[Depends(verify_api_key)])
+async def delete_project(repo_id: str):
+    result = await purge_project_data(repo_id)
+    return result
+
 
 
 @app.get("/commits")
@@ -422,6 +504,30 @@ async def get_commits(limit: int = Query(default=100, ge=1, le=1000)):
     commits = await db["activity_logs"].find({"activity_type": "commit"}).to_list(limit)
     return {"commits": [serialize_doc(c) for c in commits]}
 
+@app.post("/developer_aliases", dependencies=[Depends(verify_api_key)])
+async def create_developer_alias(payload: dict[str, Any] = Body(...)):
+    active_project = await get_active_project()
+    repo_id = payload.get("repo_id") or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
+    alias_id = payload.get("alias_id")
+    canonical_id = payload.get("canonical_id")
+    if not alias_id or not canonical_id:
+        raise HTTPException(status_code=400, detail="alias_id and canonical_id are required")
+
+    await add_developer_alias(repo_id, alias_id, canonical_id)
+    return {"repo_id": repo_id, "alias_id": alias_id.upper(), "canonical_id": canonical_id.upper()}
+
+
+@app.get("/developer_aliases")
+async def get_developer_aliases(repo_id: str | None = Query(default=None)):
+    active_project = await get_active_project()
+    effective_repo_id = repo_id or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
+    return {"repo_id": effective_repo_id, "aliases": await list_developer_aliases(effective_repo_id)}
 
 @app.post("/fetch_slack_messages", dependencies=[Depends(verify_api_key)])
 async def fetch_slack_messages_endpoint(
@@ -438,13 +544,13 @@ async def fetch_slack_messages_endpoint(
     ]
 
     if not effective_channels:
-        raise HTTPException(
-            status_code=400,
-            detail="No channel_ids provided and SLACK_CHANNEL_IDS is not set in .env",
-        )
+        raise HTTPException(status_code=400, detail="No channel_ids provided and SLACK_CHANNEL_IDS is not set in .env")
+
+    active_project = await get_active_project()
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
 
     try:
-        result = await fetch_slack_messages(effective_channels, effective_start, effective_end)
+        result = await fetch_slack_messages(effective_channels, effective_start, effective_end, repo_id=repo_id)
         invalidate_gap_detection_cache()
         return result
     except RuntimeError as exc:
@@ -468,8 +574,11 @@ async def fetch_jira_updates_endpoint(
     effective_start = start_date or (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
     effective_end = end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    active_project = await get_active_project()
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
+
     try:
-        result = await fetch_jira_updates(effective_start, effective_end, project_key)
+        result = await fetch_jira_updates(effective_start, effective_end, project_key, repo_id=repo_id)
         invalidate_gap_detection_cache()
         return result
     except RuntimeError as exc:
@@ -481,42 +590,59 @@ async def get_jira_activity(limit: int = Query(default=100, ge=1, le=1000)):
     updates = await db["activity_logs"].find({"source": "jira"}).to_list(limit)
     return {"jira_activity": [serialize_doc(update) for update in updates]}
 
-
 @app.get("/developers")
-async def get_developers(limit: int = Query(default=5000, ge=1, le=5000)):
-    # Get every distinct developer_id from actual tracked activity
-    activity_dev_ids = await db["activity_logs"].distinct("developer_id")
+async def get_developers(
+    limit: int = Query(default=5000, ge=1, le=5000),
+    repo_id: str | None = Query(default=None),   # NEW
+):
+    active_project = await get_active_project()
+    effective_repo_id = repo_id or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
+
+    activity_dev_ids = await db["activity_logs"].distinct("developer_id", {"repo_id": effective_repo_id})  # CHANGED
     activity_dev_ids = {normalize_developer_id(d) for d in activity_dev_ids if d}
 
-    # Get any manually-curated metadata that exists (name, team, etc.)
-    curated_docs = await db["developers"].find().to_list(5000)
+    curated_docs = await db["developers"].find({"repo_id": effective_repo_id}).to_list(5000)  # CHANGED
     curated_map = {
         normalize_developer_id(d.get("developer_id", d.get("_id", ""))): d
         for d in curated_docs
     }
 
-    # Merge: every real tracked developer gets a record, enriched with curated info if available
     merged = []
     for dev_id in sorted(activity_dev_ids):
-        base = {"developer_id": dev_id}
+        base = {"repo_id": effective_repo_id, "developer_id": dev_id}   # CHANGED — repo_id visible in response
         extra = curated_map.get(dev_id)
         if extra:
-            base.update({k: v for k, v in extra.items() if k not in ("_id", "developer_id")})
+            base.update({k: v for k, v in extra.items() if k not in ("_id", "developer_id", "repo_id")})
         merged.append(base)
 
-    return {"developers": merged[:limit]}
+    return {"repo_id": effective_repo_id, "developers": merged[:limit]}
 
 @app.get("/timesheets")
-async def get_timesheets(limit: int = Query(default=100, ge=1, le=1000)):
-    timesheets = await db["timesheet_entries"].find().to_list(limit)
+async def get_timesheets(
+    limit: int = Query(default=100, ge=1, le=1000),
+    repo_id: str | None = Query(default=None),   # NEW
+):
+    active_project = await get_active_project()
+    effective_repo_id = repo_id or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
+    timesheets = await db["timesheet_entries"].find({"repo_id": effective_repo_id}).to_list(limit)  # CHANGED
     return {"timesheets": [serialize_doc(ts) for ts in timesheets]}
-
 
 @app.post("/timesheets", dependencies=[Depends(verify_api_key)])
 async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Body(...)):
     entries = payload if isinstance(payload, list) else [payload]
     inserted = 0
     updated = 0
+
+    active_project = await get_active_project()
+    repo_id = active_project["repo_id"] if active_project else normalize_repo_id(settings.github_owner, settings.github_repo)
+    aliases = await load_developer_aliases(repo_id)  # NEW
+
 
     try:
         for raw_entry in entries:
@@ -526,10 +652,21 @@ async def upsert_timesheets(payload: dict[str, Any] | list[dict[str, Any]] = Bod
                     detail="Each timesheet entry must be a JSON object",
                 )
             entry = validate_timesheet_entry(raw_entry)
+            existing_activity = await db["activity_logs"].count_documents(
+            {"repo_id": repo_id, "developer_id": entry["developer_id"]}
+            )
+            if existing_activity == 0:
+                raise HTTPException(
+                status_code=422,
+                detail=f"developer_id '{entry['developer_id']}' has no tracked activity in repo_id '{repo_id}'. "
+                       f"Timesheets can only be filled for developers with real synced activity.",
+                )
+
             result = await db["timesheet_entries"].update_one(
-                {"developer_id": entry["developer_id"], "date": entry["date"]},
-                {"$set": entry},
-                upsert=True,
+                {"repo_id": repo_id, "developer_id": entry["developer_id"], "date": entry["date"]},
+                {"$set": {**entry, "status": "filled"}},
+                upsert=True,   # still upsert=True, but now it's filling a legitimate stub or creating
+                               # a valid new row — never a synthetic identity, because we just verified activity exists
             )
             if result.upserted_id:
                 inserted += 1
@@ -623,44 +760,56 @@ async def delete_timesheet(developer_id: str, date: str):
 
 
 @app.get("/detected_gaps")
-async def get_detected_gaps(limit: int = Query(default=1000, ge=1, le=5000), force: bool = Query(default=False)):
-    """Return a precomputed snapshot of detected gaps for fast responses.
+async def get_detected_gaps(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    force: bool = Query(default=False),
+    repo_id: str | None = Query(default=None),   # NEW
+):
+    active_project = await get_active_project()
+    effective_repo_id = repo_id or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
 
-    By default this reads the latest snapshot written by the background job.
-    Set `?force=true` to recompute on-demand (not recommended for regular use).
-    """
     try:
         if force:
-            result = await run_gap_detection(limit)
+            result = await run_gap_detection(limit, repo_id=effective_repo_id)
             await db["detected_gaps_snapshot"].replace_one(
-                {"name": "current"}, {"name": "current", "generated_at": datetime.now(timezone.utc).isoformat(), **result}, upsert=True
+                {"name": "current", "repo_id": effective_repo_id},   # CHANGED — repo_id in the snapshot key
+                {"name": "current", "repo_id": effective_repo_id, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
+                upsert=True,
             )
             return result
 
-        snapshot = await db["detected_gaps_snapshot"].find_one({"name": "current"})
+        snapshot = await db["detected_gaps_snapshot"].find_one({"name": "current", "repo_id": effective_repo_id})  # CHANGED
         if snapshot:
-            # Return stored fields (strip internal keys)
             return {k: v for k, v in snapshot.items() if k not in ("_id", "name", "generated_at")}
 
-        # Fallback to on-demand computation if no snapshot exists
-        result = await run_gap_detection(limit)
+        result = await run_gap_detection(limit, repo_id=effective_repo_id)
         await db["detected_gaps_snapshot"].replace_one(
-            {"name": "current"}, {"name": "current", "generated_at": datetime.now(timezone.utc).isoformat(), **result}, upsert=True
+            {"name": "current", "repo_id": effective_repo_id},
+            {"name": "current", "repo_id": effective_repo_id, "generated_at": datetime.now(timezone.utc).isoformat(), **result},
+            upsert=True,
         )
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to detect gaps: {exc}") from exc
 
-
 @app.get("/summarize_gaps")
-async def summarize_gaps():
-    gaps = await db["detected_gaps"].find({"status": "pending"}).to_list(100)
+async def summarize_gaps(repo_id: str | None = Query(default=None)):   # NEW param
+    active_project = await get_active_project()
+    effective_repo_id = repo_id or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
+
+    gaps = await db["detected_gaps"].find({"repo_id": effective_repo_id, "status": "pending"}).to_list(100)  # CHANGED
 
     if not gaps:
         return {"message": "No pending gaps found."}
 
     footprint_lookup: dict[tuple[str, str], dict[str, Any]] = {}
-    footprint_docs = await build_all_footprints(limit=max(100, len(gaps) * 5))
+    footprint_docs = await build_all_footprints(limit=max(100, len(gaps) * 5), repo_id=effective_repo_id)   # CHANGED
     for footprint in footprint_docs:
         footprint_lookup[(footprint["developer_id"], footprint["date"])] = footprint
 
@@ -669,34 +818,15 @@ async def summarize_gaps():
         developer_id = normalize_developer_id(gap.get("developer_id", "UNKNOWN"))
         date = normalize_activity_date(gap.get("date"))
         footprint = footprint_lookup.get((developer_id, date), {})
-        enriched_gap = {
-            **gap,
-            "developer_id": developer_id,
-            "date": date,
-            **footprint,
-        }
+        enriched_gap = {**gap, "developer_id": developer_id, "date": date, **footprint}
 
         from starlette.concurrency import run_in_threadpool
         summary = await run_in_threadpool(generate_ai_summary, enriched_gap)
 
-        await db["detected_gaps"].update_one(
-            {"_id": gap["_id"]},
-            {
-                "$set": {
-                    "summary": summary,
-                    "status": "summarized",
-                    "github_count": enriched_gap.get("github_count", 0),
-                    "slack_count": enriched_gap.get("slack_count", 0),
-                    "jira_count": enriched_gap.get("jira_count", 0),
-                }
-            },
-        )
+        await db["detected_gaps"].update_one({"_id": gap["_id"]}, {"$set": {"ai_summary": summary}})
+        updated.append({**enriched_gap, "ai_summary": summary})
 
-        updated.append({"developer_id": developer_id, "date": date})
-        await asyncio.sleep(2.2)
-
-    return {"message": f"Summarized {len(updated)} gaps.", "updated": updated}
-
+    return {"updated_count": len(updated), "gaps": updated}
 
 @app.post("/classify_gap")
 async def classify_gap(payload: dict[str, Any] = Body(...)):
@@ -966,35 +1096,26 @@ async def import_timesheets_csv(file: UploadFile = File(...)):
 # Phase 4: AI Analysis, Alerts, and Triage
 @app.post("/analyze_and_alert", dependencies=[Depends(verify_api_key)])
 async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
-    """
-    Full AI analysis of a gap and alert generation.
-
-    Performs:
-    - Gap classification (priority)
-    - Timesheet suggestion
-    - Alert generation and storage
-    - Optional Slack notification
-    - Optional email notification
-    """
     gap_id = payload.get("gap_id")
     developer_id = payload.get("developer_id")
     date = payload.get("date")
 
     if not all([gap_id, developer_id, date]):
-        raise HTTPException(
-            status_code=400,
-            detail="gap_id, developer_id, and date are required"
-        )
+        raise HTTPException(status_code=400, detail="gap_id, developer_id, and date are required")
+
+    active_project = await get_active_project()
+    repo_id = payload.get("repo_id") or (
+        active_project["repo_id"] if active_project
+        else normalize_repo_id(settings.github_owner, settings.github_repo)
+    )
 
     try:
-        # Get AI classifications
         priority = generate_gap_priority(payload)
         timesheet_suggestion = suggest_timesheet_entry(payload)
 
         summary = payload.get("summary", "Gap analysis performed.")
         recommended_action = f"Review suggested timesheet: {timesheet_suggestion.get('hours', 0)}h on {timesheet_suggestion.get('project', 'Unknown')}"
 
-        # Generate and store alert
         alert = await generate_alert(
             gap_id=gap_id,
             developer_id=developer_id,
@@ -1002,14 +1123,15 @@ async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
             priority=priority,
             summary=summary,
             recommended_action=recommended_action,
+            repo_id=repo_id,   # NEW
         )
 
-        # Send Slack notification if configured
         slack_sent = await send_slack_notification(alert)
 
-        # Send email notification if a recipient email was provided
+        # CHANGED — auto-resolve recipient from developers collection;
+        # payload can still override it explicitly if needed
         email_sent = False
-        recipient_email = payload.get("recipient_email")
+        recipient_email = payload.get("recipient_email") or await resolve_alert_recipient_email(repo_id, developer_id)
         if recipient_email:
             email_sent = await send_email_notification(alert, recipient_email)
 
@@ -1019,10 +1141,10 @@ async def analyze_and_alert(payload: dict[str, Any] = Body(...)):
             "suggested_timesheet": timesheet_suggestion,
             "slack_sent": slack_sent,
             "email_sent": email_sent,
+            "recipient_email": recipient_email,   # NEW — visible in response so it's clear where it came from
         }
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to analyze and alert: {exc}") from exc
-
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 @app.get("/alerts/pending")
 async def get_pending_alerts_endpoint(limit: int = Query(default=100, ge=1, le=1000)):

@@ -11,6 +11,11 @@ class Settings:
     mongo_uri: str | None = os.getenv("MONGO_URI")
     mongo_db_name: str = os.getenv("MONGO_DB_NAME", "unbilled_detective")
 
+    # (Step 2): github_owner/github_repo are now only a fallback default,
+    # used by scripts/backfill_repo_id.py and local dev when no project has
+    # been registered yet. The live source of truth is the `projects`
+    # collection via project_service.get_active_project().
+
     github_token: str | None = os.getenv("GITHUB_TOKEN")
     github_owner: str | None = os.getenv("GITHUB_OWNER")
     github_repo: str | None = os.getenv("GITHUB_REPO")
