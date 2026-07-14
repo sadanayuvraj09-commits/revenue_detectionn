@@ -10,14 +10,17 @@ from .database import db
 settings = get_settings()
 
 
-def _github_headers() -> dict[str, str]:
+def _github_headers(token_override: str | None = None) -> dict[str, str]:
     headers = {"Accept": "application/vnd.github+json"}
-    if settings.github_token:
-        headers["Authorization"] = f"Bearer {settings.github_token}"
+    token = token_override or settings.github_token
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
-async def fetch_commits(repo_owner: str, repo_name: str, user_id: str) -> dict:
+async def fetch_commits(
+    repo_owner: str, repo_name: str, user_id: str, github_token_override: str | None = None
+) -> dict:
     repo_id = normalize_repo_id(repo_owner, repo_name)
     aliases = await load_developer_aliases(repo_id)
     count = 0
@@ -29,13 +32,18 @@ async def fetch_commits(repo_owner: str, repo_name: str, user_id: str) -> dict:
         while True:
             url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/commits"
             response = await http_client.get(
-                url, headers=_github_headers(),
+                url, headers=_github_headers(github_token_override),
                 params={"per_page": 100, "page": page}, timeout=30,
             )
 
             if response.status_code != 200:
                 return {
                     "saved": count, "fetched": total_fetched,
+                    "repo": f"{repo_owner}/{repo_name}",
+                    "repo_id": repo_id,
+                    "used_token": "project override" if github_token_override else (
+                        "global GITHUB_TOKEN" if settings.github_token else "none (unauthenticated)"
+                    ),
                     "error": f"GitHub API returned {response.status_code}",
                     "details": response.text,
                 }

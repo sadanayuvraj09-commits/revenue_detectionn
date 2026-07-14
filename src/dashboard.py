@@ -111,7 +111,7 @@ def api_delete(path):
 
 # Fixed backend — not shown to regular employees. Set BACKEND_URL as a
 # Streamlit secret/env var to override without touching code.
-DEFAULT_BACKEND_URL = "https://revenue-detectionn.onrender.com"
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8001"
 base_url = os.getenv("BACKEND_URL", DEFAULT_BACKEND_URL)
 
 if not st.session_state.access_token:

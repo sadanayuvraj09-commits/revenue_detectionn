@@ -68,6 +68,31 @@ async def list_projects(user_id: str) -> list[dict[str, Any]]:
     return projects
 
 
+class ProjectAccessError(Exception):
+    """Raised when a user requests a repo_id that isn't one of their own registered projects."""
+
+
+async def resolve_scoped_repo_id(user_id: str, repo_id: str | None = None) -> str | None:
+    """
+    Return the repo_id a request should actually be scoped to for this user.
+
+    - If repo_id is explicitly passed, verify the user owns it. Raise
+      ProjectAccessError if it belongs to someone else (or doesn't exist),
+      so we never silently serve another user's data.
+    - If no repo_id is passed, use the user's active project.
+    - If the user has no active project and passed no repo_id, return None
+      (caller should return empty results, NOT fall back to a global default).
+    """
+    if repo_id:
+        owned = await db["projects"].find_one({"repo_id": repo_id, "user_id": user_id})
+        if not owned:
+            raise ProjectAccessError(f"repo_id '{repo_id}' is not registered to this user")
+        return repo_id
+
+    active_project = await get_active_project(user_id)
+    return active_project["repo_id"] if active_project else None
+
+
 async def touch_last_synced(user_id: str, repo_id: str) -> None:
     """Called after a successful fetch to record when this repo was last synced."""
     await db["projects"].update_one(

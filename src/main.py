@@ -1,4 +1,4 @@
-mport asyncio
+import asyncio
 import hashlib
 import json
 from copy import deepcopy
@@ -486,14 +486,22 @@ async def fetch_commits_endpoint(
     if not owner or not repo:
         raise HTTPException(status_code=400, detail="repo_owner and repo_name are required unless a project is registered/active.")
  
-    result = await fetch_commits(owner, repo, user_id=user_id)
+    try:
+        result = await fetch_commits(owner, repo, user_id=user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"fetch_commits crashed: {type(exc).__name__}: {exc}")
+
     if result.get("error"):
         raise HTTPException(status_code=502, detail=result)
- 
+
     repo_id = result.get("repo_id") or normalize_repo_id(owner, repo)
-    stub_result = await generate_timesheet_stubs(repo_id)   # NEW
-    result["timesheet_stubs"] = stub_result                 # NEW — visible in the response
- 
+
+    try:
+        stub_result = await generate_timesheet_stubs(repo_id)   # NEW
+        result["timesheet_stubs"] = stub_result                 # NEW — visible in the response
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"generate_timesheet_stubs crashed: {type(exc).__name__}: {exc}")
+
     if active_project and owner == active_project["owner"] and repo == active_project["repo"]:
         await touch_last_synced(user_id, active_project["repo_id"])
  
